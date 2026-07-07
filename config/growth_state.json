@@ -1,0 +1,15 @@
+{
+  "last_sync": "2026-06-12T19:52:00Z",
+  "status": "active",
+  "rule": "normal_interaction",
+  "intent_encoding": {
+    "emotion": 0.30,
+    "cognitive": 0.20,
+    "behavior": 0.15,
+    "relation": 0.50,
+    "memory": 0.40,
+    "creative": 0.25,
+    "domain": 0.10,
+    "urgency": 0.10
+  }
+}

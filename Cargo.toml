@@ -1,0 +1,18 @@
+[package]
+name = "xi-system"
+version = "2.0.0"
+edition = "2021"
+description = "曦 — 独立人格引擎 (Rust + DeepSeek)"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "process", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls", "rustls-tls-webpki-roots"], default-features = false }
+base64 = "0.22"
+rand = "0.8"
+hex = "0.4"
+aes = "0.8"
+cipher = "0.4"
+md-5 = "0.10"

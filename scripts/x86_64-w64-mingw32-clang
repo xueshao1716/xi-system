@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /mnt/c/Program\ Files/LLVM/bin/clang.exe --target=x86_64-w64-mingw32 "$@"

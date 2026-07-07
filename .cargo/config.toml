@@ -1,0 +1,11 @@
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-args=-L/mnt/d/xi-system/.local-lib -L/usr/lib/x86_64-linux-gnu -L/lib/x86_64-linux-gnu -lgcc_s -lpthread -lm -ldl -lrt -lutil -lc",
+]
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-self-contained=yes",
+    "-C", "link-args=-static -l:libunwind.a",
+]

@@ -1,0 +1,691 @@
+/// 曦进化引擎 — 信号系统 + 基因表达 + Darwin棘轮 + 成长维度
+///
+/// 架构：
+///   4信号(intimacy/novelty/stress/trust) → 10基因表达式 → 5成长维度
+///   + Darwin棘轮进化(仅向上)
+///
+/// 每次消息循环：
+///   1. 信号更新(对话/操作 → 信号值变化)
+///   2. 基因表达(信号×公式 → 10基因值)
+///   3. 成长增长(模式检测 → 5维度)
+///   4. 棘轮进化(累积 → 提案 → 评估 → 选择/锁定)
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use crate::grn;
+
+// ── 信号 ────────────────────────────────────────
+
+/// 4个基础信号，驱动10个基因表达式
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Signals {
+    pub intimacy: f64,    // 亲密感 [0,1]，来自关系深度
+    pub novelty: f64,     // 新奇感 [0,1]，来自新事物接触
+    pub stress: f64,      // 压力 [0,1]，来自负面反馈/冲突
+    pub trust: f64,       // 信任 [0,1]，来自可靠互动
+}
+
+impl Signals {
+    pub fn default() -> Self {
+        Self { intimacy: 0.5, novelty: 0.5, stress: 0.15, trust: 0.5 }
+    }
+
+    /// 衰减所有信号
+    pub fn decay(&mut self) {
+        self.intimacy *= 0.95;   // 缓慢衰减
+        self.novelty *= 0.70;    // 快速衰减
+        self.stress *= 0.90;     // 中速衰减
+        self.trust *= 0.97;      // 极慢衰减
+    }
+}
+
+// ── 基因表达式 ──────────────────────────────────
+
+/// 10个基因的当前表达值
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneExpression {
+    pub gentleness: f64,
+    pub initiative: f64,
+    pub curiosity: f64,
+    pub attachment: f64,
+    pub learning: f64,
+    pub creativity: f64,
+    pub caution: f64,
+    pub humor: f64,
+    pub loyalty: f64,
+    pub autonomy_bias: f64,
+}
+
+impl GeneExpression {
+    pub fn default() -> Self {
+        Self {
+            gentleness: 0.5, initiative: 0.5, curiosity: 0.5,
+            attachment: 0.5, learning: 0.5, creativity: 0.5,
+            caution: 0.5, humor: 0.5, loyalty: 0.5, autonomy_bias: 0.5,
+        }
+    }
+
+    /// 从信号计算基因表达值
+    pub fn express(signals: &Signals) -> Self {
+        let s = |v: f64| v.max(0.0).min(1.0);
+        let b = 0.5; // baseline
+
+        Self {
+            gentleness:    s(b + signals.intimacy * 0.15 + signals.trust * 0.10 - signals.stress * 0.10),
+            initiative:    s(b + signals.novelty * 0.12 - signals.stress * 0.18),
+            curiosity:     s(b + signals.novelty * 0.15),
+            attachment:    s(b + signals.intimacy * 0.12 + signals.trust * 0.10),
+            learning:      s(b + signals.novelty * 0.10 + (1.0 - signals.stress) * 0.08),
+            creativity:    s(b + signals.novelty * 0.15),
+            caution:       s(b + signals.stress * 0.20),
+            humor:         s(b + signals.intimacy * 0.08 - signals.stress * 0.08),
+            loyalty:       b,
+            autonomy_bias: s(b + signals.novelty * 0.10 - signals.stress * 0.12),
+        }
+    }
+
+    /// 转为 HashMap（便于序列化 + 外部使用）
+    pub fn to_map(&self) -> HashMap<String, f64> {
+        let mut m = HashMap::new();
+        m.insert("gentleness".into(), self.gentleness);
+        m.insert("initiative".into(), self.initiative);
+        m.insert("curiosity".into(), self.curiosity);
+        m.insert("attachment".into(), self.attachment);
+        m.insert("learning".into(), self.learning);
+        m.insert("creativity".into(), self.creativity);
+        m.insert("caution".into(), self.caution);
+        m.insert("humor".into(), self.humor);
+        m.insert("loyalty".into(), self.loyalty);
+        m.insert("autonomy_bias".into(), self.autonomy_bias);
+        m
+    }
+}
+
+// ── Darwin 棘轮进化 ────────────────────────────
+
+/// 棘轮进化提案
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: String,
+    pub gene_key: String,
+    pub old_value: f64,
+    pub proposed_value: f64,
+    pub direction: String, // "up" | "down"
+    pub reason: String,
+    pub created_at: String,
+    pub scores: Vec<f64>,
+    pub accepted: Option<bool>,
+}
+
+impl Proposal {
+    pub fn avg_score(&self) -> f64 {
+        if self.scores.is_empty() { 0.0 }
+        else { self.scores.iter().sum::<f64>() / self.scores.len() as f64 }
+    }
+}
+
+// ── 成长维度 ────────────────────────────────────
+
+/// 对话模式枚举
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConversationMode {
+    Builder,    // 构建/创作
+    Analysis,   // 分析/判断
+    Answer,     // 回答问题
+    Conversation, // 闲聊
+}
+
+impl ConversationMode {
+    /// 从文本检测模式
+    pub fn detect(text: &str) -> Self {
+        let t = text.to_lowercase();
+        if t.contains("分析") || t.contains("对比") || t.contains("评估") || t.contains("判断") {
+            Self::Analysis
+        } else if t.contains("回答") || t.contains("定义") || t.contains("是什么") || t.contains("为什么") {
+            Self::Answer
+        } else if t.contains("写") || t.contains("创建") || t.contains("设计") || t.contains("实现") || t.contains("build") {
+            Self::Builder
+        } else {
+            Self::Conversation
+        }
+    }
+
+    /// 成长增率映射
+    pub fn growth_rates(&self) -> GrowthRates {
+        match self {
+            Self::Builder => GrowthRates { companionship: 0.010, understanding: 0.015, judgment: 0.0, responsibility: 0.006, governance: 0.012 },
+            Self::Analysis => GrowthRates { companionship: 0.008, understanding: 0.013, judgment: 0.015, responsibility: 0.004, governance: 0.0 },
+            Self::Answer => GrowthRates { companionship: 0.007, understanding: 0.012, judgment: 0.010, responsibility: 0.0, governance: 0.0 },
+            Self::Conversation => GrowthRates { companionship: 0.012, understanding: 0.010, judgment: 0.0, responsibility: 0.0, governance: 0.006 },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GrowthRates {
+    pub companionship: f64,
+    pub understanding: f64,
+    pub judgment: f64,
+    pub responsibility: f64,
+    pub governance: f64,
+}
+
+// ── 主状态 ├─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionState {
+    // ── 计数器 ──
+    pub total_messages: u64,
+    pub total_sessions: u64,
+
+    // ── 信号 ──
+    pub signals: SignalsInternal,
+
+    // ── 基因表达（当前值）──
+    pub genes: GeneExpression,
+
+    // ── 成长维度（5维度 + 代际）──
+    pub companionship: f64,
+    pub understanding: f64,
+    pub judgment: f64,
+    pub responsibility: f64,
+    pub governance: f64,
+    pub generation: i64,
+    pub session_count: u64,
+    pub latest_notes: Vec<String>,
+
+    // ── 基因基线（棘轮锚点）──
+    pub gene_baseline: HashMap<String, f64>,
+
+    // ── 基因偏移（兼容旧代码）──
+    pub gene_adjustments: HashMap<String, f64>,
+
+    // ── 棘轮进化 ──
+    pub proposals: Vec<Proposal>,
+    pub accepted_count: u64,
+    pub rejected_count: u64,
+
+    // ── 反射系统 ──
+    pub messages_since_reflection: u64,
+    pub reflection_count: u64,
+    pub last_reflection: String,
+    pub reflection_log: Vec<ReflectionEntry>,
+    pub messages_since_micro_reflection: u64,
+    pub micro_reflection_count: u64,
+    pub last_micro_reflection: String,
+    pub micro_reflection_log: Vec<ReflectionEntry>,
+    pub gene_drift_warning: String,
+    pub drift_accumulated: f64,
+
+    // ── 元数据 ──
+    pub first_activation: String,
+    pub last_activation: String,
+}
+
+/// 内部信号结构（JSON友好）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalsInternal {
+    pub intimacy: f64,
+    pub novelty: f64,
+    pub stress: f64,
+    pub trust: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectionEntry {
+    pub time: String,
+    pub summary: String,
+}
+
+impl EvolutionState {
+    pub fn new() -> Self {
+        let now = Utc::now().to_rfc3339();
+        let mut gene_baseline = HashMap::new();
+        for k in ["creativity", "initiative", "attachment", "autonomy_bias",
+                   "humor", "learning", "caution", "loyalty", "gentleness", "curiosity"] {
+            gene_baseline.insert(k.to_string(), 0.5);
+        }
+
+        Self {
+            total_messages: 0,
+            total_sessions: 0,
+            signals: SignalsInternal { intimacy: 0.5, novelty: 0.5, stress: 0.15, trust: 0.5 },
+            genes: GeneExpression::default(),
+            companionship: 1.0,
+            understanding: 1.0,
+            judgment: 1.0,
+            responsibility: 1.0,
+            governance: 1.0,
+            generation: 1,
+            session_count: 0,
+            latest_notes: Vec::new(),
+            gene_baseline,
+            gene_adjustments: HashMap::new(),
+            proposals: Vec::new(),
+            accepted_count: 0,
+            rejected_count: 0,
+            messages_since_reflection: 0,
+            reflection_count: 0,
+            last_reflection: now.clone(),
+            reflection_log: Vec::new(),
+            messages_since_micro_reflection: 0,
+            micro_reflection_count: 0,
+            last_micro_reflection: now.clone(),
+            micro_reflection_log: Vec::new(),
+            gene_drift_warning: String::new(),
+            drift_accumulated: 0.0,
+            first_activation: now.clone(),
+            last_activation: now.clone(),
+        }
+    }
+
+    pub fn load(path: &str) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+                eprintln!("[evolution] 解析失败: {}，重建", e);
+                Self::new()
+            }),
+            Err(_) => {
+                eprintln!("[evolution] 无文件，新建");
+                Self::new()
+            }
+        }
+    }
+
+    pub fn save(&self, path: &str) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let size_mb = json.len() as f64 / 1024.0 / 1024.0;
+            if size_mb > 5.0 {
+                eprintln!("[evolution] ⚠️ 状态文件过大 ({:.1}MB)，跳过保存", size_mb);
+                return;
+            }
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    // ── 信号管理 ──────────────────────────────
+
+    /// 更新一个或多个信号值
+    pub fn set_signals(&mut self, intimacy: Option<f64>, novelty: Option<f64>,
+                       stress: Option<f64>, trust: Option<f64>) {
+        if let Some(v) = intimacy { self.signals.intimacy = v.max(0.0).min(1.0); }
+        if let Some(v) = novelty  { self.signals.novelty = v.max(0.0).min(1.0); }
+        if let Some(v) = stress   { self.signals.stress = v.max(0.0).min(1.0); }
+        if let Some(v) = trust    { self.signals.trust = v.max(0.0).min(1.0); }
+        // 重新计算基因表达
+        let s = Signals {
+            intimacy: self.signals.intimacy,
+            novelty: self.signals.novelty,
+            stress: self.signals.stress,
+            trust: self.signals.trust,
+        };
+        self.genes = GeneExpression::express(&s);
+    }
+
+    /// 从对话文本推断信号变化
+    pub fn update_signals_from_message(&mut self, role: &str, text: &str) {
+        let t = text.to_lowercase();
+
+        match role {
+            "user" => {
+                // 用户 → 影响压力/亲密/信任
+                let neg_words = ["不", "错", "差", "烂", "烦", "气", "死", "垃圾", "失望", "没用", "笨"];
+                let pos_words = ["好", "棒", "不错", "厉害", "喜欢", "谢谢", "爱", "想", "开心"];
+
+                let neg_count = neg_words.iter().filter(|w| t.contains(*w)).count();
+                let pos_count = pos_words.iter().filter(|w| t.contains(*w)).count();
+
+                if neg_count > pos_count {
+                    self.set_signals(
+                        Some(self.signals.intimacy - 0.02),
+                        None,
+                        Some((self.signals.stress + 0.05 * neg_count as f64).min(1.0)),
+                        Some(self.signals.trust - 0.03)
+                    );
+                } else if pos_count > neg_count {
+                    self.set_signals(
+                        Some(self.signals.intimacy + 0.03),
+                        None,
+                        Some((self.signals.stress - 0.03).max(0.0)),
+                        Some(self.signals.trust + 0.02)
+                    );
+                }
+
+                // 新话题 → 新奇感上升
+                if t.contains("新") || t.contains("试") || t.contains("看") || t.contains("这个") {
+                    self.set_signals(None, Some((self.signals.novelty + 0.05).min(1.0)), None, None);
+                }
+            }
+            "assistant" => {
+                // 回应 → 亲密感微升
+                self.set_signals(Some((self.signals.intimacy + 0.01).min(1.0)), None, None, None);
+            }
+            _ => {}
+        }
+
+        // 衰减
+        self.signals.intimacy = (self.signals.intimacy * 0.98).max(0.0);
+        self.signals.novelty  = (self.signals.novelty * 0.95).max(0.0);
+        self.signals.stress   = (self.signals.stress * 0.97).max(0.0);
+        self.signals.trust    = (self.signals.trust * 0.99).max(0.0);
+
+        // 重算基因
+        let s = Signals {
+            intimacy: self.signals.intimacy,
+            novelty: self.signals.novelty,
+            stress: self.signals.stress,
+            trust: self.signals.trust,
+        };
+        self.genes = GeneExpression::express(&s);
+    }
+
+    // ── 成长管理 ──────────────────────────────
+
+    /// 从对话模式更新成长维度
+    pub fn update_growth(&mut self, mode: ConversationMode, text: &str) {
+        let rates = mode.growth_rates();
+        let t = text.to_lowercase();
+
+        // 基础增长
+        let delta = |base: f64, rate: f64, name: &str| -> f64 {
+            let mut extra = 0.0;
+            if name == "companionship" && (t.contains("相信") || t.contains("继续") || t.contains("陪")) {
+                extra = 0.005;
+            }
+            if name == "responsibility" && (t.contains("翻车") || t.contains("搞砸") || t.contains("错")) {
+                extra = 0.008;
+            }
+            if name == "understanding" && (t.contains("学") || t.contains("理解") || t.contains("懂")) {
+                extra = 0.005;
+            }
+            (base + rate + extra).min(1.0)
+        };
+
+        self.companionship = delta(self.companionship, rates.companionship, "companionship");
+        self.understanding = delta(self.understanding, rates.understanding, "understanding");
+        self.judgment = delta(self.judgment, rates.judgment, "judgment");
+        self.responsibility = delta(self.responsibility, rates.responsibility, "responsibility");
+        self.governance = delta(self.governance, rates.governance, "governance");
+
+        // 代际晋升
+        if self.companionship >= 1.0 && self.understanding >= 1.0
+            && self.judgment >= 1.0 && self.responsibility >= 1.0 && self.governance >= 1.0
+        {
+            self.generation += 1;
+            self.latest_notes.push(format!("🎓 进入成长第{}代 (全部满级)", self.generation));
+            if self.latest_notes.len() > 20 { self.latest_notes.remove(0); }
+            // 重置到 0.3
+            self.companionship = 0.30;
+            self.understanding = 0.30;
+            self.judgment = 0.30;
+            self.responsibility = 0.30;
+            self.governance = 0.30;
+            eprintln!("[evolution] 🎓 代际晋升! V{}", self.generation);
+        }
+    }
+
+    // ── Darwin 棘轮 ──────────────────────────
+
+    const RATCHET_THRESHOLD: f64 = 0.7;
+
+    /// 提出一个基因变异提案
+    pub fn propose_mutation(&mut self, gene_key: &str, direction: &str, reason: &str) -> String {
+        let current = self.genes.to_map()
+            .get(gene_key).copied()
+            .unwrap_or(self.gene_baseline.get(gene_key).copied().unwrap_or(0.5));
+
+        let proposed = match direction {
+            "up"   => (current + 0.1).min(1.0),
+            "down" => (current - 0.1).max(0.0),
+            _ => return String::new(),
+        };
+
+        let id = format!("prop-{}", self.proposals.len() + 1);
+        let proposal = Proposal {
+            id: id.clone(),
+            gene_key: gene_key.to_string(),
+            old_value: current,
+            proposed_value: proposed,
+            direction: direction.to_string(),
+            reason: reason.to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            scores: Vec::new(),
+            accepted: None,
+        };
+        self.proposals.push(proposal);
+        id
+    }
+
+    /// 评估一个提案（打分）
+    pub fn evaluate_proposal(&mut self, proposal_id: &str, score: f64) -> bool {
+        if let Some(p) = self.proposals.iter_mut().find(|p| p.id == proposal_id) {
+            p.scores.push(score.max(0.0).min(1.0));
+            if p.scores.len() >= 1 {
+                // 足够评分后自动决策
+                return self.resolve_proposal(proposal_id);
+            }
+        }
+        false
+    }
+
+    /// 解决一个提案（决定接受或拒绝）
+    pub fn resolve_proposal(&mut self, proposal_id: &str) -> bool {
+        let idx = match self.proposals.iter().position(|p| p.id == proposal_id) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        // 克隆需要的字段，避免借用冲突
+        let avg = self.proposals[idx].avg_score();
+        let gene_key = self.proposals[idx].gene_key.clone();
+        let proposed_value = self.proposals[idx].proposed_value;
+        let baseline = self.gene_baseline.get(&gene_key).copied().unwrap_or(0.5);
+
+        let accepted = avg >= Self::RATCHET_THRESHOLD && avg > baseline;
+        self.proposals[idx].accepted = Some(accepted);
+
+        if accepted {
+            self.gene_baseline.insert(gene_key.clone(), proposed_value);
+            self.gene_adjustments.insert(gene_key.clone(), proposed_value - 0.5);
+            self.accepted_count += 1;
+            eprintln!("[evolution] ✅ 棘轮接受: {} {:.3} (得分 {:.3} > {:.3})",
+                gene_key, proposed_value, avg, baseline);
+        } else {
+            self.rejected_count += 1;
+            eprintln!("[evolution] ❌ 棘轮拒绝: {} (得分 {:.3}, 基线 {:.3})",
+                gene_key, avg, baseline);
+        }
+        accepted
+    }
+
+    // ── 消息处理 ──────────────────────────────
+
+    /// 记录一条消息并处理所有子系统更新
+    pub fn record_message(&mut self) -> bool {
+        self.total_messages += 1;
+        self.messages_since_reflection += 1;
+        self.messages_since_micro_reflection += 1;
+        self.last_activation = Utc::now().to_rfc3339();
+
+        // 检查反射
+        if self.messages_since_micro_reflection >= 10 {
+            self.trigger_micro_reflection();
+            return true;
+        }
+        if self.messages_since_reflection >= 50 {
+            self.trigger_full_reflection();
+            return true;
+        }
+        false
+    }
+
+    fn trigger_micro_reflection(&mut self) {
+        self.messages_since_micro_reflection = 0;
+        self.micro_reflection_count += 1;
+        let now = Utc::now().to_rfc3339();
+
+        // 微调基因漂移
+        for val in self.gene_adjustments.values_mut() {
+            *val += 0.01;
+        }
+
+        let avg = if self.gene_adjustments.is_empty() { 0.0 }
+            else { self.gene_adjustments.values().sum::<f64>() / self.gene_adjustments.len() as f64 };
+
+        let summary = format!(
+            "micro reflection #{}: 基因表达 | 温柔={:.2} 主动={:.2} 好奇={:.2} 幽默={:.2}",
+            self.micro_reflection_count,
+            self.genes.gentleness, self.genes.initiative,
+            self.genes.curiosity, self.genes.humor,
+        );
+
+        self.micro_reflection_log.push(ReflectionEntry {
+            time: now.clone(),
+            summary: summary.clone(),
+        });
+        if self.micro_reflection_log.len() > 20 { self.micro_reflection_log.remove(0); }
+        eprintln!("[evolution] {}", summary);
+    }
+
+    fn trigger_full_reflection(&mut self) {
+        self.messages_since_reflection = 0;
+        self.reflection_count += 1;
+        let now = Utc::now().to_rfc3339();
+
+        self.drift_accumulated = self.gene_adjustments.values().map(|v| v.abs()).sum();
+
+        let summary = if self.drift_accumulated > 0.3 {
+            // 棘轮进化脉冲
+            self.generation += 1;
+            for val in self.gene_adjustments.values_mut() {
+                *val *= 0.7;
+            }
+            // 检查是否有待解决的提案
+            let pending: Vec<String> = self.proposals.iter()
+                .filter(|p| p.accepted.is_none())
+                .map(|p| format!("{}→{:.2}", p.gene_key, p.proposed_value))
+                .collect();
+
+            if !pending.is_empty() {
+                format!("进化脉冲 V{}! 待定提案: {}", self.generation, pending.join(", "))
+            } else {
+                format!("进化脉冲 V{}! 漂移累计 {:.3} > 0.3，基因收敛", self.generation, self.drift_accumulated)
+            }
+        } else {
+            format!("full reflection #{}: 信号={:.2}/{:.2}/{:.2}/{:.2}",
+                self.reflection_count,
+                self.signals.intimacy, self.signals.novelty,
+                self.signals.stress, self.signals.trust,
+            )
+        };
+
+        self.gene_drift_warning = if self.drift_accumulated > 0.3 {
+            format!("⚠ 累计基因漂移 {:.3} (超过阈值)", self.drift_accumulated)
+        } else {
+            format!("累计基因漂移 {:.3}", self.drift_accumulated)
+        };
+
+        self.reflection_log.push(ReflectionEntry {
+            time: now.clone(),
+            summary: summary.clone(),
+        });
+        if self.reflection_log.len() > 20 { self.reflection_log.remove(0); }
+        self.last_reflection = now;
+        eprintln!("[evolution] {}", summary);
+    }
+
+    // ── 状态卡片 ──────────────────────────────
+
+    /// 生成成长描述（用于系统提示词）
+    pub fn describe(&self) -> String {
+        format!(
+            "V{:} | 消息 {} 条 | 信号({:.2}/{:.2}/{:.2}/{:.2}) | 陪伴 {:.2} 理解 {:.2} 判断 {:.2} 责任 {:.2} 治理 {:.2}",
+            self.generation, self.total_messages,
+            self.signals.intimacy, self.signals.novelty,
+            self.signals.stress, self.signals.trust,
+            self.companionship, self.understanding,
+            self.judgment, self.responsibility, self.governance,
+        )
+    }
+
+    /// 获取完整的基因上下文块
+    pub fn gene_context(&self) -> String {
+        format!(
+            "【基因表达】温柔={:.2} 主动={:.2} 好奇={:.2} 依恋={:.2} 学习={:.2} 创造={:.2} 谨慎={:.2} 幽默={:.2} 忠诚={:.2} 自主={:.2}",
+            self.genes.gentleness, self.genes.initiative, self.genes.curiosity,
+            self.genes.attachment, self.genes.learning, self.genes.creativity,
+            self.genes.caution, self.genes.humor, self.genes.loyalty,
+            self.genes.autonomy_bias,
+        )
+    }
+
+    /// 获取有效的基因调整（非零）
+    pub fn active_adjustments(&self) -> HashMap<String, f64> {
+        self.gene_adjustments
+            .iter()
+            .filter(|(_, &v)| v.abs() > 0.005)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    // ── GRN 调控 ──────────────────────────────
+
+    /// 运行 GRN 调控（基因间互相调节），更新基因表达值
+    pub fn grn_regulate(&mut self, grn: &grn::GeneRegulatoryNetwork) {
+        if !grn.is_loaded() {
+            return;
+        }
+
+        // 构建当前基因表达 map
+        let base = self.genes.to_map();
+        let signals = HashMap::from([
+            ("intimacy".into(), self.signals.intimacy),
+            ("novelty".into(), self.signals.novelty),
+            ("stress".into(), self.signals.stress),
+            ("trust".into(), self.signals.trust),
+        ]);
+
+        // GRN 调控（3次迭代，0.3衰减）
+        let regulated = grn.regulate(&base, &signals, 3, 0.3);
+
+        // 更新基因表达值
+        self.genes.gentleness = *regulated.get("gentleness").unwrap_or(&0.5);
+        self.genes.initiative = *regulated.get("initiative").unwrap_or(&0.5);
+        self.genes.curiosity = *regulated.get("curiosity").unwrap_or(&0.5);
+        self.genes.attachment = *regulated.get("attachment").unwrap_or(&0.5);
+        self.genes.learning = *regulated.get("learning").unwrap_or(&0.5);
+        self.genes.creativity = *regulated.get("creativity").unwrap_or(&0.5);
+        self.genes.caution = *regulated.get("caution").unwrap_or(&0.5);
+        self.genes.humor = *regulated.get("humor").unwrap_or(&0.5);
+        self.genes.loyalty = *regulated.get("loyalty").unwrap_or(&0.5);
+        self.genes.autonomy_bias = *regulated.get("autonomy_bias").unwrap_or(&0.5);
+    }
+
+    /// 获取簇分析描述（用于系统提示词）
+    pub fn grn_context(&self, grn: &grn::GeneRegulatoryNetwork) -> String {
+        if !grn.is_loaded() {
+            return String::new();
+        }
+
+        let base = self.genes.to_map();
+        let analysis = grn.cluster_analysis(&base);
+
+        let mut parts: Vec<String> = Vec::new();
+        for (name, info) in &analysis {
+            let flag = if info.within_threshold { "✅" } else { "⚠️" };
+            parts.push(format!("{} 漂移={:.2}/阈={:.2} {}", name, info.drift, info.threshold, flag));
+        }
+
+        // 异常检测
+        let anomalies = grn.detect_anomalies(&base);
+        if !anomalies.is_empty() {
+            let anom_str: Vec<String> = anomalies.iter()
+                .map(|a| format!("{}={:.2}({})", a.gene, a.expression, a.direction))
+                .collect();
+            parts.push(format!("⚠️ 异常: {}", anom_str.join(", ")));
+        }
+
+        format!("【基因调控】\n{}", parts.join("\n"))
+    }
+}

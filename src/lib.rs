@@ -1,0 +1,29 @@
+/// _?v2 _?____?///
+/// __________?main.rs ____________
+
+
+pub mod aibody_bridge;
+pub mod aesthetics;
+pub mod assets;
+pub mod brain;
+pub mod ctx2soft;
+pub mod dream;
+pub mod emotion;
+pub mod evidence_first;
+pub mod evolution;
+pub mod grn;
+pub mod matrix_bridge;
+pub mod memory;
+pub mod organs;
+pub mod poller;
+pub mod proactive;
+pub mod reflexion;
+pub mod scenario;
+pub mod self_drive;
+pub mod self_harness;
+pub mod soul;
+pub mod throat;
+pub mod token_budget;
+pub mod tools;
+pub mod wechat;
+pub mod direct_llm;

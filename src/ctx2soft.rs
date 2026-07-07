@@ -1,0 +1,1776 @@
+/// Ctx2Soft V2 - Context-to-Skill Module
+///
+/// Overview:
+/// - PaiCLI Skill System: 3-layer skills (builtin/user/project) + SkillEvolver + SkillContextBuffer
+/// - EmbodiSkill: 4 reflection types (Discovery/Optimization/SkillDefect/ExecutionLapse)
+/// - SkillEvolver: K=4 strategy variants + contrastive update + 9-dimension scoring
+/// - ctx2skill: pattern detection + skill auto-extraction
+///
+/// Pipeline:
+///   1. Pattern detection: tool query / repeated Q&A / emotion / retry
+///   2. Skill creation: generate with K=4 strategy variants, audit before commit
+///   3. 9-dimension scoring: evaluate/score per dimension, commit if score > threshold (17%)
+///   4. Layer priority: builtin (highest) / user (middle) / project (lowest precedence in lookup)
+///   5. Memory integration: system prompt, skill index, body appendix, execution memory
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+// Constants
+const MAX_SKILL_HISTORY: usize = 8;
+const AUDIT_THRESHOLD: f64 = 5.0;
+
+// SkillLayer: priority ranking
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SkillLayer {
+    // Highest priority: system built-in skills
+    Builtin,
+    // User-created skills
+    User,
+    // Project-level skills
+    Project,
+}
+
+impl SkillLayer {
+    pub fn rank(&self) -> u8 {
+        match self {
+            SkillLayer::Builtin => 0,
+            SkillLayer::User => 1,
+            SkillLayer::Project => 2,
+        }
+    }
+}
+
+// EmbodiSkill: 4 reflection types for skill evolution
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReflectionType {
+    /// Successful pattern discovery (no prior skill)
+    Discovery,
+    /// Optimization: existing skill improved
+    Optimization,
+    /// Skill defect: skill logic itself is broken
+    SkillDefect,
+    /// Execution lapse: external/network/API error
+    ExecutionLapse,
+}
+
+#[derive(Debug, Clone)]
+pub enum CrossTimeDecision {
+    AcceptNew,
+    KeepOld(String),
+    Merge,
+}
+
+impl ReflectionType {
+    /// Classify execution outcome into a reflection type
+    pub fn classify(success: bool, skill_used: bool, exec_detail: &str) -> Self {
+        if success && !skill_used {
+            return ReflectionType::Discovery;
+        }
+        if success {
+            return ReflectionType::Optimization;
+        }
+        // Check for execution lapses (external/infra errors)
+        let detail = exec_detail.to_lowercase();
+        let is_exec_lapse = {
+            detail.contains("timeout")
+                || detail.contains("timed out")
+                || detail.contains("connection refused")
+                || detail.contains("connection reset")
+                || detail.contains("dns")
+                || detail.contains("insufficient balance")
+                || detail.contains("402")
+                || detail.contains("401")
+                || detail.contains("403")
+                || detail.contains("429")
+                || detail.contains("rate limit")
+                || detail.contains("api key")
+                || detail.contains("service unavailable")
+                || detail.contains("no such file")
+                // Browser/fetch failures
+                || detail.contains("browser fetch error")
+                || detail.contains("chrome error")
+                || detail.contains("empty response")
+        };
+        if is_exec_lapse {
+            ReflectionType::ExecutionLapse
+        } else {
+            ReflectionType::SkillDefect
+        }
+    }
+
+    pub fn should_update_skill(&self) -> bool {
+        matches!(
+            self,
+            ReflectionType::Discovery | ReflectionType::Optimization | ReflectionType::SkillDefect
+        )
+    }
+}
+
+// SkillEvolver: K=4 strategy variant struct
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyVariant {
+    pub strategy: String,
+    pub approach: String,
+    pub steps: Vec<String>,
+    pub score: f64,
+}
+
+// 9-dimension audit report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditReport {
+    pub passed: bool,
+    pub dimension_scores: Vec<(String, f64)>,
+    pub failures: Vec<String>,
+}
+
+pub struct Auditor;
+
+impl Auditor {
+    /// 9-dimension audit check
+    pub fn audit(skill: &Skill) -> AuditReport {
+        let mut scores = Vec::new();
+        let mut failures = Vec::new();
+
+        // 1. Format check: name and description must be present
+        let format_score = if !skill.name.is_empty() && !skill.description.is_empty() {
+            1.0
+        } else {
+            failures.push("missing name or description".to_string());
+            0.0
+        };
+        scores.push(("format_check".into(), format_score));
+
+        // 2. Description quality: at least 10 chars
+        let desc_score = if skill.description.len() >= 10 {
+            1.0
+        } else {
+            0.5
+        };
+        scores.push(("description_quality".into(), desc_score));
+
+        // 3. Trigger conditions: at least 2 triggers recommended
+        let trigger_score = if skill.trigger_conditions.len() >= 2 {
+            1.0
+        } else if skill.trigger_conditions.len() == 1 {
+            0.6
+        } else {
+            failures.push("no trigger conditions defined".to_string());
+            0.0
+        };
+        scores.push(("trigger_conditions".into(), trigger_score));
+
+        // 4. Body steps: at least 2 steps recommended
+        let steps_score = if skill.body_steps.len() >= 3 {
+            1.0
+        } else if skill.body_steps.len() >= 2 {
+            0.7
+        } else {
+            failures.push("insufficient body steps".to_string());
+            0.0
+        };
+        scores.push(("body_steps".into(), steps_score));
+
+        // 5. Execution coverage: steps that look actionable
+        let exec_count = skill
+            .body_steps
+            .iter()
+            .filter(|s| {
+                let t = s.trim();
+                t.starts_with(|c: char| c.is_ascii_digit())
+                    || t.starts_with("1.")
+                    || t.starts_with("2.")
+                    || t.starts_with("3.")
+                    || t.starts_with("-")
+                    || t.starts_with("*")
+            })
+            .count();
+        let exec_score = if skill.body_steps.is_empty() {
+            0.0
+        } else {
+            (exec_count as f64 / skill.body_steps.len() as f64).min(1.0)
+        };
+        if exec_score < 0.5 {
+            failures.push("low execution coverage in steps".into());
+        }
+        scores.push(("execution_coverage".into(), exec_score));
+
+        // 6. Consistency: description should match body content
+        let mut consistent = true;
+        if skill.description.contains("web search")
+            && skill.body_steps.iter().all(|s| !s.contains("web"))
+        {
+            consistent = false;
+        }
+        let consist_score = if consistent {
+            1.0
+        } else {
+            failures.push("description-body inconsistency".into());
+            0.3
+        };
+        scores.push(("consistency".into(), consist_score));
+
+        // 7. Tag coverage
+        let tag_score = if skill.tags.len() >= 2 {
+            1.0
+        } else if skill.tags.len() == 1 {
+            0.5
+        } else {
+            0.0
+        };
+        if tag_score == 0.0 {
+            failures.push("no tags defined".into());
+        }
+        scores.push(("tag_coverage".into(), tag_score));
+
+        // 8. Conflict check: contradictory instructions
+        let no_conflict = !skill
+            .body_steps
+            .iter()
+            .any(|s| s.contains("always") && s.contains("never"));
+        if !no_conflict {
+            failures.push("conflicting instructions detected".into());
+        }
+        scores.push(("no_conflict".into(), if no_conflict { 1.0 } else { 0.0 }));
+
+        // 9. Version maturity
+        let ver_score = if skill.version > 0 { 1.0 } else { 0.5 };
+        scores.push(("version_maturity".into(), ver_score));
+
+        let total: f64 = scores.iter().map(|(_, s)| s).sum();
+        let passed = total >= AUDIT_THRESHOLD;
+
+        AuditReport {
+            passed,
+            dimension_scores: scores,
+            failures,
+        }
+    }
+}
+
+// Skill memory: tracks execution history similar to MUSE-Autoskill .memory.md
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillMemory {
+    /// Successful execution contexts with timestamps
+    pub success_contexts: Vec<String>,
+    /// Failure patterns encountered
+    pub failure_patterns: Vec<String>,
+    /// Edge cases and unusual scenarios
+    pub edge_cases: Vec<String>,
+    /// Total execution count
+    pub total_executions: u32,
+}
+
+impl SkillMemory {
+    pub fn new() -> Self {
+        Self {
+            success_contexts: Vec::new(),
+            failure_patterns: Vec::new(),
+            edge_cases: Vec::new(),
+            total_executions: 0,
+        }
+    }
+
+    /// Record a successful execution
+    pub fn record_success(&mut self, context: &str) {
+        self.total_executions += 1;
+        let entry = format!(
+            "[{}] {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M"),
+            context
+        );
+        if !self.success_contexts.contains(&entry) {
+            self.success_contexts.push(entry);
+            if self.success_contexts.len() > 20 {
+                self.success_contexts.remove(0);
+            }
+        }
+    }
+
+    /// Record a failure pattern
+    pub fn record_failure(&mut self, pattern: &str) {
+        self.total_executions += 1;
+        let entry = format!(
+            "[{}] {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M"),
+            pattern
+        );
+        if !self.failure_patterns.contains(&entry) {
+            self.failure_patterns.push(entry);
+            if self.failure_patterns.len() > 20 {
+                self.failure_patterns.remove(0);
+            }
+        }
+    }
+
+    /// Record an edge case
+    pub fn record_edge_case(&mut self, case: &str) {
+        let entry = format!(
+            "[{}] {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M"),
+            case
+        );
+        if !self.edge_cases.contains(&entry) {
+            self.edge_cases.push(entry);
+            if self.edge_cases.len() > 10 {
+                self.edge_cases.remove(0);
+            }
+        }
+    }
+
+    /// Render memory as a readable string
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.success_contexts.is_empty() {
+            parts.push("Recent success contexts:".to_string());
+            for ctx in self.success_contexts.iter().rev().take(5) {
+                parts.push(format!("  - {}", ctx));
+            }
+        }
+        if !self.failure_patterns.is_empty() {
+            parts.push("Failure patterns encountered:".to_string());
+            for pat in self.failure_patterns.iter().rev().take(5) {
+                parts.push(format!("  - {}", pat));
+            }
+        }
+        if !self.edge_cases.is_empty() {
+            parts.push("Edge cases observed:".to_string());
+            for ec in self.edge_cases.iter().rev().take(3) {
+                parts.push(format!("  - {}", ec));
+            }
+        }
+        if !parts.is_empty() {
+            parts.insert(
+                0,
+                format!("## Skill Memory (total {} executions)", self.total_executions),
+            );
+        }
+        parts.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Skill {
+    pub id: String,
+    pub name: String,
+    pub version: u32,
+    pub layer: SkillLayer,
+    pub description: String,
+    pub index_summary: String,
+    // Trigger conditions for skill activation
+    pub trigger_conditions: Vec<String>,
+    pub body_steps: Vec<String>,
+    // Body appendix: supplementary notes for S_body
+    pub body_appendix: Vec<String>,
+    // Examples: (S_body, S_appendix) pairs
+    pub examples: Vec<String>,
+    pub tags: Vec<String>,
+    pub quality_score: f64,
+    pub usage_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_reflection: String,
+    // TE (Task Effectiveness) tracking
+    pub positive_uses: u32,
+    // Successful skill invocations
+    pub negative_uses: u32,
+    // Failed skill invocations
+    #[serde(default)]
+    pub memory: SkillMemory,
+    // ECC instinct confidence score
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+    // ECC instinct confidence score
+    #[serde(default)]
+    pub last_used_at: String,
+    // For TTL-based pruning
+    #[serde(default)]
+    pub related_skills: Vec<String>,
+    // Skills that share knowledge with this one
+    #[serde(default)]
+    pub risk_constraints: Option<serde_json::Value>,
+    // Macro skill risk constraints (not_for/risk/mitigation)
+}
+
+fn default_confidence() -> f64 {
+    0.5
+}
+
+// Failure record for tracking execution failures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureRecord {
+    pub skill_id: String,
+    pub timestamp: String,
+    pub context: String,
+    pub reflection: ReflectionType,
+    pub exec_error_detail: String,
+}
+
+// [SkillOpt] Rejection buffer: tracks failed skill proposals for negative feedback
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectionRecord {
+    pub skill_name: String,
+    pub rejected_score: f64,
+    pub best_score: f64,
+    pub delta: f64,
+    pub reason: String,
+    pub timestamp: String,
+}
+
+// Conversation turn for pattern detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+}
+
+// Version tracking entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillVersionEntry {
+    pub skill_id: String,
+    pub version: u32,
+    pub skill: Skill,
+    pub peak_score: f64,
+    pub scores: Vec<f64>,
+    pub evaluated_at: String,
+}
+
+// Main state struct for ctx2soft module
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ctx2SoftState {
+    // Skill storage by layer
+    pub builtin_skills: HashMap<String, Skill>,
+    // Built-in skills
+    pub user_skills: HashMap<String, Skill>,
+    // User-created skills
+    pub project_skills: HashMap<String, Skill>,
+    // Project-level skills
+
+    // Version history
+    pub version_history: HashMap<String, Vec<SkillVersionEntry>>,
+    // Execution failure log
+    pub failure_log: Vec<FailureRecord>,
+    pub extraction_count: u32,
+    pub audit_blocked_count: u32,
+    pub last_extraction: String,
+    // Active skill IDs for D-memory
+    pub active_skill_ids: Vec<String>,
+    // Conversation buffer for pattern detection
+    pub conversation_buffer: Vec<ConversationTurn>,
+    // Trajectory buffer for RPA candidate detection
+    #[serde(default)]
+    pub recent_trajectories: Vec<String>,
+    // circular buffer of recent trajectory signatures
+    #[serde(default)]
+    pub trajectory_count: u64,
+    // [SkillOpt] Rejection buffer for negative feedback learning
+    #[serde(default)]
+    pub rejection_buffer: Vec<RejectionRecord>,
+    // [SkillOpt] Optimizer model config — separate model for skill refinement
+    #[serde(default)]
+    pub optimizer_endpoint: String,
+    #[serde(default)]
+    pub optimizer_model: String,
+}
+
+impl Ctx2SoftState {
+    pub fn new() -> Self {
+        let now = Utc::now().to_rfc3339();
+        Self {
+            builtin_skills: HashMap::new(),
+            user_skills: HashMap::new(),
+            project_skills: HashMap::new(),
+            version_history: HashMap::new(),
+            failure_log: Vec::new(),
+            extraction_count: 0,
+            audit_blocked_count: 0,
+            last_extraction: now,
+            active_skill_ids: Vec::new(),
+            conversation_buffer: Vec::new(),
+            recent_trajectories: Vec::new(),
+            trajectory_count: 0,
+            rejection_buffer: Vec::new(),
+            optimizer_endpoint: String::new(),
+            optimizer_model: String::new(),
+        }
+    }
+
+    pub fn load(path: &str) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+                eprintln!(
+                    "[ctx2soft] Failed to deserialize: {}, using defaults",
+                    e
+                );
+                Self::new()
+            }),
+            Err(_) => {
+                eprintln!("[ctx2soft] File not found, using defaults");
+                Self::new()
+            }
+        }
+    }
+
+    pub fn save(&self, path: &str) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, &json);
+        }
+    }
+
+    // Lookup order: project > user > builtin
+    /// Get a skill by name, with project > user > builtin priority
+    pub fn get_skill(&self, name: &str) -> Option<&Skill> {
+        self.project_skills
+            .get(name)
+            .or_else(|| self.user_skills.get(name))
+            .or_else(|| self.builtin_skills.get(name))
+    }
+
+    pub fn get_skill_mut(&mut self, name: &str, layer: &SkillLayer) -> Option<&mut Skill> {
+        match layer {
+            SkillLayer::Builtin => self.builtin_skills.get_mut(name),
+            SkillLayer::User => self.user_skills.get_mut(name),
+            SkillLayer::Project => self.project_skills.get_mut(name),
+        }
+    }
+
+    /// Build a summary index of all skills (index only, not full body)
+    pub fn skill_index(&self) -> String {
+        let mut entries: Vec<&Skill> = Vec::new();
+        // Deduplicate: project > user > builtin
+        let mut seen = HashSet::new();
+        for skills in [&self.project_skills, &self.user_skills, &self.builtin_skills] {
+            for (name, skill) in skills {
+                if seen.insert(name) && !skill.index_summary.is_empty() {
+                    entries.push(skill);
+                }
+            }
+        }
+        if entries.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec!["## Available Skills Index".to_string()];
+        for s in entries {
+            let exec_info = if s.memory.total_executions > 0 {
+                format!(
+                    " [{} exec, {} successes]",
+                    s.memory.total_executions,
+                    s.memory.success_contexts.len()
+                )
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "  {} -> {}{}",
+                s.name, s.index_summary, exec_info
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// Load the full skill body (S_body + S_appendix)
+    pub fn load_skill_body(&self, name: &str) -> Option<String> {
+        let skill = self.get_skill(name)?;
+        let mut parts = Vec::new();
+        parts.push(format!("# {} v{}", skill.name, skill.version));
+        parts.push(format!("Description: {}", skill.description));
+        parts.push(String::new());
+
+        // S_body: execution steps
+        parts.push("## Execution Steps:".to_string());
+        for (i, step) in skill.body_steps.iter().enumerate() {
+            parts.push(format!("{}. {}", i + 1, step));
+        }
+        parts.push(String::new());
+
+        // S_appendix: supplementary notes
+        if !skill.body_appendix.is_empty() {
+            parts.push("## Supplementary Notes".to_string());
+            for note in &skill.body_appendix {
+                parts.push(format!("- {}", note));
+            }
+            parts.push(String::new());
+        }
+
+        if !skill.examples.is_empty() {
+            parts.push("## Examples".to_string());
+            for ex in &skill.examples {
+                parts.push(format!("- {}", ex));
+            }
+        }
+
+        // Skill execution memory
+        let memory_text = skill.memory.render();
+        if !memory_text.is_empty() {
+            parts.push(String::new());
+            parts.push(memory_text);
+        }
+        Some(parts.join("\n"))
+    }
+
+    // Conversation buffer management
+    pub fn add_turn(&mut self, role: &str, content: &str) {
+        self.conversation_buffer.push(ConversationTurn {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+        });
+        if self.conversation_buffer.len() > 50 {
+            self.conversation_buffer.remove(0);
+        }
+    }
+
+    /// Detect behavioral patterns from conversation window + trajectory data
+    pub fn detect_patterns(&self, window: &[ConversationTurn]) -> Vec<String> {
+        let mut patterns = Vec::new();
+
+        if window.len() < 3 {
+            return patterns;
+        }
+
+        // Pattern 1: tool query pattern
+        let tool_count = window
+            .iter()
+            .filter(|t| {
+                let c = t.content.to_lowercase();
+                c.contains("search")
+                    || c.contains("fetch")
+                    || c.contains("query")
+                    || c.contains("browse")
+            })
+            .count();
+        if tool_count >= 3 {
+            patterns.push(format!(
+                "tool_query_pattern: {} tool-related messages in window",
+                tool_count
+            ));
+        }
+
+        // Pattern 2: repeated Q&A
+        let pattern_keywords = [
+            "what is",
+            "how to do",
+            "can you help",
+            "please explain",
+            "tell me about",
+        ];
+        for kw in &pattern_keywords {
+            let count = window
+                .iter()
+                .filter(|t| t.role == "user" && t.content.contains(kw))
+                .count();
+            if count >= 2 {
+                patterns.push(format!(
+                    "repeated_qa_pattern: '{}' repeated {} times",
+                    kw, count
+                ));
+            }
+        }
+
+        // Pattern 3: emotional escalation
+        let emotion_count = window
+            .iter()
+            .filter(|t| {
+                let c = t.content.to_lowercase();
+                c.contains("frustrated")
+                    || c.contains("angry")
+                    || c.contains("upset")
+                    || c.contains("annoyed")
+            })
+            .count();
+        if emotion_count >= 2 {
+            patterns.push(format!(
+                "emotion_escalation: {} emotional messages detected",
+                emotion_count
+            ));
+        }
+
+        // Pattern 4 (retry): failure + retry in same window
+        let fail_count = window
+            .iter()
+            .filter(|t| {
+                t.role == "user"
+                    && (t.content.contains("failed")
+                        || t.content.contains("error")
+                        || t.content.contains("try again")
+                        || t.content.contains("didn't work"))
+            })
+            .count();
+        if fail_count >= 2 {
+            patterns.push(format!(
+                "retry_loop_pattern: {} failure/retry messages, recommend dedicated recovery skill",
+                fail_count
+            ));
+        }
+
+        patterns
+    }
+
+    // Build a skill from a detected pattern (EmbodiSkill S_body, S_appendix)
+    pub fn skill_from_pattern(&self, pattern: &str, layer: SkillLayer) -> Option<Skill> {
+        let name = self.pattern_to_name(pattern);
+        let id = format!("sk-{}", name.replace(" ", "-").to_lowercase());
+        let now = Utc::now().to_rfc3339();
+
+        let (trigger_conditions, body_steps, body_appendix, tags, examples, index_summary) =
+            self.build_skill_body(pattern);
+
+        Some(Skill {
+            id,
+            name,
+            version: 1,
+            layer,
+            description: pattern.to_string(),
+            index_summary,
+            trigger_conditions,
+            body_steps,
+            body_appendix,
+            examples,
+            tags,
+            quality_score: 0.5,
+            usage_count: 0,
+            created_at: now.clone(),
+            positive_uses: 0,
+            negative_uses: 0,
+            updated_at: now.clone(),
+            last_reflection: "new".to_string(),
+            memory: SkillMemory::new(),
+            confidence: 0.5,
+            last_used_at: now,
+            related_skills: Vec::new(),
+            risk_constraints: None,
+        })
+    }
+
+    fn pattern_to_name(&self, pattern: &str) -> String {
+        if pattern.contains("tool_query_pattern") {
+            "tool-query".into()
+        } else if pattern.contains("what is") {
+            "analysis-pattern".into()
+        } else if pattern.contains("how to do") {
+            "comparison".into()
+        } else if pattern.contains("can you help") {
+            "evaluation".into()
+        } else if pattern.contains("please explain") {
+            "summarization".into()
+        } else if pattern.contains("tell me about") {
+            "explanation".into()
+        } else if pattern.contains("emotion_escalation") {
+            "emotion-support".into()
+        } else if pattern.contains("failure-pattern") {
+            "failure-recovery".into()
+        } else {
+            format!(
+                "custom-{}",
+                &pattern[..pattern.len().min(10)]
+            )
+        }
+    }
+
+    fn build_skill_body(
+        &self,
+        pattern: &str,
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        String,
+    ) {
+        let mut triggers = Vec::new();
+        let mut steps = Vec::new();
+        let mut appendix = Vec::new();
+        let mut tags = Vec::new();
+        let examples: Vec<String> = Vec::new();
+        let index_summary: String;
+
+        if pattern.contains("tool_query_pattern") {
+            triggers.push("user asks to search/query/browse".into());
+            triggers.push("web research / data fetch / browse task".into());
+            steps.push("parse the search intent from user query".into());
+            steps.push("execute search via tool (web search/browser fetch)".into());
+            steps.push("summarize and format results for the user".into());
+            appendix.push(
+                "Handle browser fetch errors gracefully, fallback to alternative sources"
+                    .into(),
+            );
+            appendix.push("Prefer mobile-friendly sources when iPhone UA detected".into());
+            tags = vec!["tool".into(), "query".into(), "research".into()];
+            index_summary = "automated web search and data retrieval skill".into();
+        } else if pattern.contains("what is") {
+            triggers.push("user asks a knowledge question".into());
+            triggers.push("analysis / comparison / classification / evaluation".into());
+            steps.push("understand the core question".into());
+            steps.push("analyze from multiple angles (data / context / comparison)".into());
+            steps.push("synthesize a clear structured answer".into());
+            steps.push("provide confidence assessment".into());
+            appendix.push(
+                "Include source citations when making factual claims".into(),
+            );
+            tags = vec!["analysis".into(), "reasoning".into()];
+            index_summary = "structured analysis and reasoning skill".into();
+        } else if pattern.contains("emotion_escalation") {
+            triggers.push("user expresses frustration or emotional distress".into());
+            triggers.push("empathy / support / reassurance / active listening".into());
+            steps.push("acknowledge the user's emotional state".into());
+            steps.push("provide comfort and understanding".into());
+            steps.push("offer constructive suggestions if appropriate".into());
+            appendix.push(
+                "Avoid dismissive language, prioritize emotional validation".into(),
+            );
+            tags = vec!["emotion".into(), "companion".into(), "support".into()];
+            index_summary = "emotional support and companionship skill".into();
+        } else if pattern.contains("failure-pattern") {
+            triggers.push("repeated execution failures or retry loops".into());
+            triggers.push("error handling / fallback / graceful degradation".into());
+            steps.push("diagnose the root cause of repeated failures".into());
+            steps.push(
+                "check for API key / balance / service availability issues".into(),
+            );
+            steps.push("apply alternative approaches or report to user".into());
+            appendix.push(
+                "Log failure patterns for future avoidance".into(),
+            );
+            tags = vec!["debug".into(), "recovery".into()];
+            index_summary =
+                "failure recovery: diagnose and handle repeated execution errors".into();
+        } else {
+            triggers.push("general pattern detected in conversation".into());
+            steps.push("identify the user's core intent".into());
+            steps.push("formulate an appropriate response".into());
+            steps.push("verify the response quality".into());
+            appendix.push(
+                "This is an auto-generated skill, review and refine as needed".into(),
+            );
+            tags = vec!["pattern-auto".into()];
+            index_summary = "auto-generated pattern handling skill".into();
+        }
+
+        (triggers, steps, appendix, tags, examples, index_summary)
+    }
+
+    /// 9-dimension skill evaluation scoring
+    pub fn evaluate_skill(&self, skill: &Skill) -> f64 {
+        let mut score = 0.0f64;
+        let max_score = 9.0f64;
+
+        // Description quality (0~1)
+        if !skill.description.is_empty() && skill.description.len() > 10 {
+            score += 0.5;
+        }
+        // Trigger conditions (0~1)
+        if skill.trigger_conditions.len() >= 2 {
+            score += 1.0;
+        } else if skill.trigger_conditions.len() == 1 {
+            score += 0.5;
+        }
+        // Body steps (0~1.5)
+        if skill.body_steps.len() >= 3 {
+            score += 1.5;
+        } else if skill.body_steps.len() >= 2 {
+            score += 1.0;
+        } else if !skill.body_steps.is_empty() {
+            score += 0.5;
+        }
+        // Appendix
+        if !skill.body_appendix.is_empty() {
+            score += 0.5;
+        }
+        // Examples
+        if !skill.examples.is_empty() {
+            score += 1.0;
+        }
+        // Tags
+        if skill.tags.len() >= 2 {
+            score += 0.5;
+        }
+        // Specificity: longer trigger conditions indicate specificity
+        let specific = skill
+            .trigger_conditions
+            .iter()
+            .filter(|t| t.len() > 15)
+            .count() as f64;
+        score += specific.min(1.0);
+        // Executability: numbered or prefixed steps
+        let exec = skill
+            .body_steps
+            .iter()
+            .filter(|s| {
+                s.starts_with(|c: char| c.is_ascii_digit())
+                    || s.starts_with("_")
+                    || s.starts_with("-")
+            })
+            .count() as f64;
+        score += (exec / skill.body_steps.len().max(1) as f64).min(1.0);
+        // Usage
+        if skill.usage_count > 0 {
+            score += 0.5;
+        }
+        // Version maturity
+        if skill.version > 1 {
+            score += 0.5;
+        }
+
+        (score / max_score).min(1.0)
+    }
+
+    // EmbodiSkill: reflection on execution outcome
+    /// Reflect on a skill execution, update state accordingly
+    pub fn reflect_on_execution(
+        &mut self,
+        skill_name: &str,
+        success: bool,
+        skill_used: bool,
+        exec_detail: &str,
+    ) -> ReflectionType {
+        let reflection = ReflectionType::classify(success, skill_used, exec_detail);
+
+        // Find the skill in user or project layer
+        let skill = {
+            let from_user = self.get_skill_mut(skill_name, &SkillLayer::User);
+            if from_user.is_some() {
+                from_user
+            } else {
+                self.get_skill_mut(skill_name, &SkillLayer::Project)
+            }
+        };
+
+        if let Some(skill) = skill {
+            skill.last_reflection = format!("{:?}", reflection);
+            skill.usage_count += 1;
+
+            if reflection.should_update_skill() {
+                skill.version += 1;
+                skill.updated_at = Utc::now().to_rfc3339();
+            }
+
+            // TE (Task Effectiveness) tracking
+            match &reflection {
+                ReflectionType::Discovery | ReflectionType::Optimization => {
+                    skill.positive_uses += 1;
+                }
+                ReflectionType::SkillDefect | ReflectionType::ExecutionLapse => {
+                    skill.negative_uses += 1;
+                }
+            }
+
+            // Skill memory updates
+            if success {
+                skill.memory.record_success(exec_detail);
+            } else {
+                skill.memory.record_failure(exec_detail);
+            }
+
+            // ECC Instinct confidence adjustment
+            if success {
+                skill.confidence = (skill.confidence + 0.05).min(1.0);
+            } else {
+                skill.confidence = (skill.confidence - 0.1).max(0.0);
+            }
+            skill.last_used_at = Utc::now().to_rfc3339();
+        }
+
+        // Record to failure log
+        if !success {
+            self.failure_log.push(FailureRecord {
+                skill_id: skill_name.to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                context: exec_detail.to_string(),
+                reflection: reflection.clone(),
+                exec_error_detail: exec_detail.to_string(),
+            });
+            if self.failure_log.len() > 50 {
+                self.failure_log.remove(0);
+            }
+        }
+
+        reflection
+    }
+
+    // SkillEvolver: K=4 strategy variant generation
+    /// Generate 4 strategy variants for a given skill
+    pub fn generate_strategies(&self, skill: &Skill, context: &str) -> Vec<StrategyVariant> {
+        let mut variants = Vec::new();
+
+        // Strategy 1: conservative - keep current approach, minimal changes
+        variants.push(StrategyVariant {
+            strategy: "conservative".into(),
+            approach: "maintain current approach, minimal modifications".into(),
+            steps: skill.body_steps.clone(),
+            score: skill.quality_score,
+        });
+
+        // Strategy 2: aggressive - expand scope significantly
+        variants.push(StrategyVariant {
+            strategy: "aggressive".into(),
+            approach: "significantly expand scope and coverage".into(),
+            steps: {
+                let mut s = skill.body_steps.clone();
+                s.push("additional: expand coverage to edge cases".into());
+                s
+            },
+            score: skill.quality_score * 0.9, // slight risk penalty
+        });
+
+        // Strategy 3: focused - narrow down to key steps
+        variants.push(StrategyVariant {
+            strategy: "focused".into(),
+            approach: "narrow focus, prioritize core execution path".into(),
+            steps: {
+                let mut s = skill.body_steps.clone();
+                s.insert(0, "pre-check: validate core conditions first".into());
+                s
+            },
+            score: skill.quality_score * 0.95,
+        });
+
+        // Strategy 4: branching - add conditional logic
+        variants.push(StrategyVariant {
+            strategy: "branching".into(),
+            approach: "add conditional branches for different scenarios".into(),
+            steps: {
+                let mut s = skill.body_steps.clone();
+                s.push(
+                    if context.contains("error handling") {
+                        "add fallback branch for error cases".into()
+                    } else {
+                        "add alternative path for edge cases".into()
+                    },
+                );
+                s
+            },
+            score: skill.quality_score * 0.85,
+        });
+
+        variants
+    }
+
+    /// Contrastive update: extract differences between success and failure trajectories
+    pub fn contrastive_update(
+        &mut self,
+        skill_name: &str,
+        success_trajectory: &[String],
+        failure_trajectory: &[String],
+    ) -> Option<String> {
+        // Find the skill in user or project layer
+        let skill = {
+            let from_user = self.get_skill_mut(skill_name, &SkillLayer::User);
+            if from_user.is_some() {
+                from_user
+            } else {
+                self.get_skill_mut(skill_name, &SkillLayer::Project)
+            }
+        };
+
+        let skill = skill?;
+
+        let diff: Vec<String> = success_trajectory
+            .iter()
+            .filter(|s| !failure_trajectory.contains(s))
+            .cloned()
+            .collect();
+
+        if !diff.is_empty() {
+            for d in &diff {
+                if !skill.body_appendix.contains(d) {
+                    skill.body_appendix.push(d.clone());
+                }
+            }
+            skill.version += 1;
+            skill.updated_at = Utc::now().to_rfc3339();
+            Some(format!("updated {} changes", diff.len()))
+        } else {
+            None
+        }
+    }
+
+    // [SkillOpt] Optimizer model reflection — uses separate model to analyze failures
+    // and propose skill edits. The optimizer "watches" the target model and edits the manual.
+    pub fn optimizer_reflect(&mut self, skill_name: &str, failure_context: &str) -> Option<String> {
+        if self.optimizer_endpoint.is_empty() || self.optimizer_model.is_empty() {
+            return None; // No optimizer configured
+        }
+        let skill = self
+            .get_skill(skill_name)
+            .cloned();
+        let skill_text = serde_json::to_string_pretty(&skill).ok()?;
+
+        let prompt = format!(
+            "You are a skill optimizer. Analyze this skill and its failure context.\n\n\
+             ## Current Skill\n{}\n\n\
+             ## Failure Context\n{}\n\n\
+             ## Task\nAnalyze why the skill failed. Propose 1-3 specific edits (ADD/DELETE/REPLACE).\n\
+             Return ONLY a JSON array of edits, each with 'op', 'target', 'content' fields.\n\
+             Example: [{{\"op\":\"ADD\",\"target\":\"body_steps\",\"content\":\"new step\"}}]\n\
+             If no improvement needed, return empty array: []",
+            skill_text, failure_context
+        );
+
+        // Call optimizer model via HTTP
+        let payload = serde_json::json!({
+            "model": self.optimizer_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .ok()?;
+
+        let resp = client.post(&self.optimizer_endpoint)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .ok()?;
+
+        let body: serde_json::Value = resp.json().ok()?;
+        let content = body["choices"][0]["message"]["content"].as_str()?;
+
+        // Parse edits from response
+        let edits: Vec<serde_json::Value> = serde_json::from_str(
+            content.trim().trim_start_matches("```json").trim_end_matches("```")
+        ).ok()?;
+
+        if edits.is_empty() {
+            return None;
+        }
+
+        // Apply edits (max 4 per round — SkillOpt textual learning rate)
+        let mut applied = 0;
+        let skill_mut = if self.user_skills.contains_key(skill_name) {
+            self.user_skills.get_mut(skill_name)
+        } else {
+            self.project_skills.get_mut(skill_name)
+        };
+
+        let skill_mut = if let Some(s) = skill_mut { s } else { return None };        for edit in edits.iter().take(4) {
+            let op = edit["op"].as_str().unwrap_or("");
+            let target = edit["target"].as_str().unwrap_or("");
+            let content_val = edit["content"].as_str().unwrap_or("");
+
+            if content_val.is_empty() { continue; }
+
+            match op {
+                "ADD" => {
+                    if target == "body_steps" {
+                        skill_mut.body_steps.push(content_val.to_string());
+                        applied += 1;
+                    } else if target == "body_appendix" {
+                        skill_mut.body_appendix.push(content_val.to_string());
+                        applied += 1;
+                    }
+                }
+                "DELETE" => {
+                    if target == "body_steps" {
+                        skill_mut.body_steps.retain(|s| s != content_val);
+                        applied += 1;
+                    }
+                }
+                "REPLACE" => {
+                    if target == "body_steps" {
+                        if let Some(pos) = skill_mut.body_steps.iter().position(|s| s.contains(content_val)) {
+                            skill_mut.body_steps[pos] = content_val.to_string();
+                            applied += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if applied > 0 {
+            skill_mut.version += 1;
+            skill_mut.updated_at = Utc::now().to_rfc3339();
+            Some(format!("optimizer applied {} edits to {}", applied, skill_name))
+        } else {
+            None
+        }
+    }
+
+    // Main extraction pipeline: detect + create + audit + commit
+    /// Run the full skill extraction pipeline
+    pub fn run_pipeline(&mut self) -> Vec<String> {
+        let mut reports = Vec::new();
+
+        if self.conversation_buffer.len() < 3 {
+            return reports;
+        }
+
+        let window: Vec<ConversationTurn> = self
+            .conversation_buffer
+            .iter()
+            .rev()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        // Phase 1: detect patterns
+        let patterns = self.detect_patterns(&window);
+        if patterns.is_empty() {
+            return reports;
+        }
+
+        for pattern in &patterns {
+            let pattern_name = self.pattern_to_name(pattern);
+
+            // Check if skill already exists
+            let existing = self.user_skills.contains_key(&pattern_name)
+                || self.project_skills.contains_key(&pattern_name)
+                || self.builtin_skills.contains_key(&pattern_name);
+
+            if existing {
+                // Update existing skill with K=4 strategy evolution
+                let existing_clone = self
+                    .user_skills
+                    .get(&pattern_name)
+                    .or_else(|| self.project_skills.get(&pattern_name))
+                    .cloned();
+
+                if let Some(existing_skill) = existing_clone {
+                    // Generate K=4 strategies
+                    let variants = self.generate_strategies(&existing_skill, pattern);
+                    if let Some(best) = variants
+                        .into_iter()
+                        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+                    {
+                        let mut candidate = existing_skill;
+                        candidate.body_steps = best.steps;
+                        candidate.version += 1;
+
+                        let audit = Auditor::audit(&candidate);
+                        if audit.passed {
+                            let new_score = self.evaluate_skill(&candidate);
+                            let decision = self.cross_time_select(&pattern_name, new_score);
+                            match decision {
+                                CrossTimeDecision::AcceptNew => {
+                                    candidate.quality_score = new_score;
+                                    let cand_version = candidate.version;
+                                    if let Some(skill_mut) = self
+                                        .user_skills
+                                        .get_mut(&pattern_name)
+                                        .or_else(|| self.project_skills.get_mut(&pattern_name))
+                                    {
+                                        *skill_mut = candidate;
+                                        let snap = skill_mut.clone();
+                                        self.record_version(&snap, new_score);
+                                    }
+                                    reports.push(format!(
+                                        "Skill updated: {} new version v{} (score: {:.2})",
+                                        pattern_name, cand_version, new_score
+                                    ));
+                                }
+                                CrossTimeDecision::KeepOld(_) => {
+                                    reports.push(format!(
+                                        "Skill {} kept (new score {:.2} not better)",
+                                        pattern_name, new_score
+                                    ));
+                                }
+                                CrossTimeDecision::Merge => {
+                                    let merged_version = candidate.version;
+                                    let mut merged_skill = candidate;
+                                    merged_skill.version += 1;
+                                    merged_skill.updated_at = Utc::now().to_rfc3339();
+                                    let quality = merged_skill.quality_score;
+                                    let snap = merged_skill.clone();
+                                    if let Some(skill_mut) = self
+                                        .user_skills
+                                        .get_mut(&pattern_name)
+                                        .or_else(|| self.project_skills.get_mut(&pattern_name))
+                                    {
+                                        *skill_mut = merged_skill;
+                                        self.record_version(&snap, quality);
+                                    }
+                                    reports.push(format!(
+                                        "Skill merged: {} new version (v{})",
+                                        pattern_name,
+                                        merged_version + 1
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.audit_blocked_count += 1;
+                            reports.push(format!(
+                                "Audit failed for {}: {}",
+                                pattern_name,
+                                audit.failures.join(", ")
+                            ));
+                        }
+                    }
+                }
+            } else {
+                // Create new skill
+                if let Some(mut skill) = self.skill_from_pattern(pattern, SkillLayer::User) {
+                    let audit = Auditor::audit(&skill);
+                    if audit.passed || skill.trigger_conditions.len() >= 2 {
+                        let score = self.evaluate_skill(&skill);
+                        skill.quality_score = score;
+                        let sid = skill.name.clone();
+                        self.record_version(&skill, score);
+                        self.user_skills.insert(sid.clone(), skill);
+                        self.active_skill_ids.push(sid.clone());
+                        reports.push(format!(
+                            "New skill created: {} (score: {:.2})",
+                            sid, score
+                        ));
+                    } else {
+                        self.audit_blocked_count += 1;
+                        reports.push(format!(
+                            "Skill creation blocked for {}: {}",
+                            pattern_name,
+                            audit.failures.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        // [EmbodiSkill/SkillEvolver] Contrastive analysis phase:
+        // Compare recent SkillDefect failures against successful skill steps
+        // to extract improvement points automatically
+        let recent_defects: Vec<(String, String)> = self.failure_log.iter().filter(|f| {
+            matches!(f.reflection, ReflectionType::SkillDefect)
+                && chrono::DateTime::parse_from_rfc3339(&f.timestamp)
+                    .ok()
+                    .map(|t| (Utc::now() - t.with_timezone(&Utc)).num_hours() < 24)
+                    .unwrap_or(false)
+        }).map(|f| (f.skill_id.clone(), f.context.clone())).collect();
+
+        for (skill_id, context) in &recent_defects {
+            let success_steps: Vec<String> = self
+                .user_skills
+                .get(skill_id)
+                .or_else(|| self.project_skills.get(skill_id))
+                .map(|s| s.body_steps.clone())
+                .unwrap_or_default();
+            if !success_steps.is_empty() {
+                let failure_steps: Vec<String> = context
+                    .split("; ")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !failure_steps.is_empty() {
+                    if let Some(msg) = self.contrastive_update(
+                        skill_id,
+                        &success_steps,
+                        &failure_steps,
+                    ) {
+                        reports.push(format!(
+                            "Contrastive update for {}: {}",
+                            skill_id, msg
+                        ));
+                    }
+                    // [SkillOpt] Also try optimizer model reflection for deeper analysis
+                    if let Some(msg) = self.optimizer_reflect(skill_id, context) {
+                        reports.push(format!("Optimizer reflect: {}", msg));
+                    }
+                }
+            }
+        }
+
+        self.extraction_count += reports.len() as u32;
+        self.last_extraction = Utc::now().to_rfc3339();
+        reports
+    }
+
+    // Record a version snapshot
+    pub fn record_version(&mut self, skill: &Skill, score: f64) {
+        let entry = SkillVersionEntry {
+            skill_id: skill.id.clone(),
+            version: skill.version,
+            skill: skill.clone(),
+            peak_score: score,
+            scores: vec![score],
+            evaluated_at: Utc::now().to_rfc3339(),
+        };
+        self.version_history
+            .entry(skill.id.clone())
+            .or_insert_with(Vec::new)
+            .push(entry);
+
+        if let Some(entries) = self.version_history.get_mut(&skill.id) {
+            if entries.len() > MAX_SKILL_HISTORY {
+                entries.sort_by(|a, b| b.peak_score.partial_cmp(&a.peak_score).unwrap());
+                entries.truncate(MAX_SKILL_HISTORY);
+            }
+        }
+    }
+
+    pub fn cross_time_select(&mut self, skill_name: &str, new_score: f64) -> CrossTimeDecision {
+        let entries = self.version_history.get(skill_name);
+        if entries.is_none() || entries.unwrap().is_empty() {
+            return CrossTimeDecision::AcceptNew;
+        }
+        let entries = entries.unwrap();
+
+        let best = entries
+            .iter()
+            .max_by(|a, b| a.peak_score.partial_cmp(&b.peak_score).unwrap())
+            .unwrap();
+
+        let gap = new_score - best.peak_score;
+        if gap > 0.05 {
+            CrossTimeDecision::AcceptNew
+        } else {
+            // [SkillOpt] Record rejection in buffer for negative feedback learning
+            let delta = new_score - best.peak_score;
+            let reason = if delta.abs() < 0.05 {
+                "score too close to best (no improvement)".to_string()
+            } else {
+                format!("score dropped by {:.2}", delta.abs())
+            };
+            self.rejection_buffer.push(RejectionRecord {
+                skill_name: skill_name.to_string(),
+                rejected_score: new_score,
+                best_score: best.peak_score,
+                delta,
+                reason,
+                timestamp: Utc::now().to_rfc3339(),
+            });
+            // Keep rejection buffer bounded (last 50)
+            if self.rejection_buffer.len() > 50 {
+                self.rejection_buffer = self.rejection_buffer.split_off(self.rejection_buffer.len() - 50);
+            }
+
+            if delta < -0.05 {
+                CrossTimeDecision::KeepOld(format!("{:?}", best.skill))
+            } else {
+                CrossTimeDecision::Merge
+            }
+        }
+    }
+
+    pub fn run_cross_time_eval(&mut self) -> Vec<String> {
+        let mut reports = Vec::new();
+        let mut rollbacks: Vec<(String, Skill)> = Vec::new();
+
+        for (id, entries) in &self.version_history {
+            if entries.len() < 2 {
+                continue;
+            }
+
+            if let Some(best) = entries
+                .iter()
+                .max_by(|a, b| a.peak_score.partial_cmp(&b.peak_score).unwrap())
+            {
+                // Compare current version against best historical
+                let current = self
+                    .user_skills
+                    .get(id)
+                    .or_else(|| self.project_skills.get(id));
+
+                if let Some(current) = current {
+                    if current.quality_score < best.peak_score - 0.05 {
+                        reports.push(format!(
+                            "{} current score {:.2} below historical peak {:.2} (v{}) - recommend rollback",
+                            id, current.quality_score, best.peak_score, best.version
+                        ));
+                        rollbacks.push((id.clone(), best.skill.clone()));
+                    }
+                }
+            }
+        }
+
+        for (id, skill) in rollbacks {
+            if self.user_skills.contains_key(&id) {
+                self.user_skills.insert(id, skill);
+            } else if self.project_skills.contains_key(&id) {
+                self.project_skills.insert(id, skill);
+            }
+        }
+
+        reports
+    }
+
+    // Module summary
+    pub fn summary(&self) -> String {
+        let total = self.builtin_skills.len() + self.user_skills.len() + self.project_skills.len();
+        let mut lines = vec![
+            format!("[ctx2soft] Skill inventory: {} (builtin:{} / user:{} / project:{})",
+                total, self.builtin_skills.len(), self.user_skills.len(), self.project_skills.len()),
+            format!("Extractions: {} | Audit blocked: {} | Failure records: {}",
+                self.extraction_count, self.audit_blocked_count, self.failure_log.len()),
+            format!("Active skill IDs: {}", self.active_skill_ids.len()),
+        ];
+
+        // Audit block rate
+        let total_attempts = self.extraction_count + self.audit_blocked_count;
+        if total_attempts > 0 {
+            let block_rate = self.audit_blocked_count as f64 / total_attempts as f64 * 100.0;
+            lines.push(format!("Audit block rate: {:.1}%", block_rate));
+        }
+
+        // TE (Task Effectiveness) issues
+        let all_skills: Vec<&Skill> = self
+            .user_skills
+            .values()
+            .chain(self.project_skills.values())
+            .collect();
+        let mut te_issues: Vec<(String, f64, u32, u32)> = all_skills
+            .iter()
+            .filter(|s| s.usage_count >= 3)
+            .map(|s| {
+                let te = s.positive_uses as f64 / s.usage_count as f64;
+                (s.name.clone(), te, s.positive_uses, s.negative_uses)
+            })
+            .filter(|(_, te, _, neg)| *te < 0.5 || *neg >= 2)
+            .collect();
+        te_issues.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        if !te_issues.is_empty() {
+            lines.push(format!("Skills with low TE (< 50%):"));
+            for (name, te, pos, neg) in &te_issues {
+                lines.push(format!(
+                    "  {} TE={:.0}% (+{}/-{})",
+                    name,
+                    te * 100.0,
+                    pos,
+                    neg
+                ));
+            }
+        }
+
+        // Failure breakdown
+        let skill_defect_count = self
+            .failure_log
+            .iter()
+            .filter(|f| matches!(f.reflection, ReflectionType::SkillDefect))
+            .count();
+        let exec_lapse_count = self
+            .failure_log
+            .iter()
+            .filter(|f| matches!(f.reflection, ReflectionType::ExecutionLapse))
+            .count();
+        if !self.failure_log.is_empty() {
+            lines.push(format!(
+                "Failure breakdown: skill_defect={} exec_lapse={} total={}",
+                skill_defect_count,
+                exec_lapse_count,
+                self.failure_log.len()
+            ));
+        }
+
+        lines.join("\n")
+    }
+
+    /// Record a trajectory signature for RPA candidate detection
+    /// trajectory: list of "tool name(args preview)" signatures
+    pub fn record_trajectory(&mut self, trajectory: &[String]) {
+        if trajectory.is_empty() {
+            return;
+        }
+        // Require at least 2 steps for a meaningful trajectory
+        if trajectory.len() < 2 {
+            return;
+        }
+        // Build signature from last 10 steps
+        let signature: String = trajectory.join(" -> ");
+        let recent_sigs: Vec<String> = self
+            .recent_trajectories
+            .iter()
+            .rev()
+            .take(10)
+            .cloned()
+            .collect();
+        if recent_sigs.contains(&signature) {
+            return; // Deduplicate
+        }
+        self.recent_trajectories.push(signature);
+        self.trajectory_count += 1;
+
+        // Keep buffer at max 50
+        if self.recent_trajectories.len() > 50 {
+            self.recent_trajectories
+                .drain(0..self.recent_trajectories.len() - 50);
+        }
+        println!(
+            "  [Ctx2Skill] Recorded trajectory #{} ({} steps)",
+            self.trajectory_count,
+            trajectory.len()
+        );
+    }
+
+    /// Get RPA candidates: trajectories that appear 3+ times
+    pub fn rpa_candidates(&self) -> Vec<String> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for sig in &self.recent_trajectories {
+            *counts.entry(sig).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 3)
+            .map(|(sig, count)| format!("[{}x] {}", count, sig))
+            .collect()
+    }
+
+    /// Prune skills: remove low-confidence/old User-layer Skills
+    /// Skills with confidence < 0.3 or unused for 30+ days are removed
+    pub fn prune(&mut self) -> Vec<String> {
+        let mut removed = Vec::new();
+        let now = chrono::Utc::now();
+
+        // Collect keys first to avoid borrow conflict
+        let keys_to_remove: Vec<String> = self
+            .user_skills
+            .iter()
+            .filter(|(_, skill)| {
+                // Low confidence
+                if skill.confidence < 0.3 {
+                    return true;
+                }
+                // 30+ days unused with positive usage count
+                if let Ok(last_used) =
+                    chrono::DateTime::parse_from_rfc3339(&skill.last_used_at)
+                {
+                    let last_used_utc = last_used.with_timezone(&chrono::Utc);
+                    let days_since = (now - last_used_utc).num_days();
+                    if days_since > 30 && skill.usage_count > 0 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in keys_to_remove {
+            if let Some(skill) = self.user_skills.remove(&key) {
+                println!(
+                    "  [Ctx2Skill] Pruned skill: {} (confidence: {:.2}, last used: {})",
+                    skill.name, skill.confidence, skill.last_used_at
+                );
+                removed.push(skill.name);
+            }
+        }
+        removed
+    }
+
+    /// Auto-promote Skill to Project layer based on confidence instinct
+    /// Promotes User-layer Skills with confidence >= 0.8 to Project layer
+    pub fn auto_promote(&mut self) -> Vec<String> {
+        let mut promoted = Vec::new();
+
+        // Collect keys first
+        let keys_to_promote: Vec<String> = self
+            .user_skills
+            .iter()
+            .filter(|(_, skill)| skill.confidence >= 0.8 && skill.usage_count >= 3)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in keys_to_promote {
+            if let Some(mut skill) = self.user_skills.remove(&key) {
+                println!(
+                    "  [Ctx2Skill] Auto-promoted skill: {} (confidence: {:.2} -> Project layer)",
+                    skill.name, skill.confidence
+                );
+                skill.layer = SkillLayer::Project;
+                skill.version += 1;
+                skill.updated_at = chrono::Utc::now().to_rfc3339();
+                self.project_skills.insert(skill.name.clone(), skill);
+                promoted.push(key);
+            }
+        }
+        promoted
+    }
+
+    /// Auto-create a skill from repeated trajectory patterns (MUSE create-evaluate-register)
+    /// When the same trajectory pattern appears 3+ times, auto-generate a Skill
+    pub fn auto_create_skill_from_trajectory(&mut self) -> Option<String> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for sig in &self.recent_trajectories {
+            *counts.entry(sig).or_insert(0) += 1;
+        }
+
+        // Find a trajectory that appeared 3+ times
+        for (sig, count) in counts.iter() {
+            if *count < 3 {
+                continue;
+            }
+
+            // Extract a readable name from the trajectory signature
+            let skill_name = sig
+                .split('(')
+                .next()
+                .unwrap_or("auto trajectory")
+                .replace("exec", "auto exec")
+                .replace("web get", "auto web");
+
+            // Skip if skill already exists
+            if self.get_skill(&skill_name).is_some() {
+                continue;
+            }
+
+            // Build skill from trajectory steps
+            let steps: Vec<String> = sig
+                .split(" -> ")
+                .map(|s| format!("step: {}", s))
+                .collect();
+            let triggers = vec![
+                format!("repeated trajectory pattern ({} occurrences)", count),
+                format!("trajectory: {}", sig),
+            ];
+            let mut tags = vec!["auto-generated".to_string(), "trajectory".to_string()];
+            if sig.contains("exec") {
+                tags.push("tool".to_string());
+            }
+            if sig.contains("web get") {
+                tags.push("web".to_string());
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let new_skill = Skill {
+                id: format!("auto {} {}", skill_name, count),
+                name: skill_name.clone(),
+                version: 1,
+                layer: SkillLayer::User,
+                description: format!(
+                    "auto skill from {} trajectories (count: {})",
+                    skill_name, count
+                ),
+                index_summary: format!(
+                    "auto skill for {} ({} occurrences)",
+                    skill_name, count
+                ),
+                trigger_conditions: triggers,
+                body_steps: steps,
+                body_appendix: vec![format!(
+                    "created {} with {} trajectories",
+                    &now[..10],
+                    count
+                )],
+                examples: Vec::new(),
+                tags,
+                quality_score: 0.6,
+                usage_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_reflection: "Discovery".to_string(),
+                positive_uses: 0,
+                negative_uses: 0,
+                memory: SkillMemory::new(),
+                confidence: 0.5,
+                last_used_at: now,
+                related_skills: Vec::new(),
+                risk_constraints: None,
+            };
+
+            let name = new_skill.name.clone();
+            println!(
+                "  [Ctx2Skill] Auto-created skill: {} (from {} trajectories)",
+                name, count
+            );
+            self.user_skills.insert(name.clone(), new_skill);
+            return Some(name);
+        }
+        None
+    }
+}

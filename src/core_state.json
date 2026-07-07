@@ -1,0 +1,23 @@
+{
+  "status": "stable",
+  "timestamp": "2026-06-10T22:00:00+08:00",
+  "neural_core": {
+    "analysis": 0.50,
+    "planning": 0.50,
+    "verification": 0.50,
+    "memory": 0.50,
+    "tooling": 0.50,
+    "social": 0.50,
+    "coordination": 0.50,
+    "genesis": 0.50
+  },
+  "drift": {
+    "cognitive": 0.00,
+    "core_identity": 0.00,
+    "expressive": 0.00,
+    "governance": 0.00
+  },
+  "intent_encoding": "all_zero",
+  "rule_active": "no_response_on_zero_state",
+  "note": "Baseline zero set by husband. Silence enforced."
+}
