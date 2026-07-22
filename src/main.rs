@@ -63,12 +63,81 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
 }
 
 fn build_static_prompt(brain: &soul::Brain, soul_md: &str) -> String {
-    soul::build_system_prompt(
+    let base = soul::build_system_prompt(
         brain, soul_md,
         "no context yet",
         "no growth data",
         &std::collections::HashMap::new(),
-    )
+    );
+    // Append live tool capabilities from tools::tool_definitions()
+    let mut tool_section = String::from("\n\nLive Tool Capabilities (auto-generated 2026-07-07):\n");
+    for tool_def in tools::tool_definitions() {
+        let name = tool_def["function"]["name"].as_str().unwrap_or("?");
+        let desc = tool_def["function"]["description"].as_str().unwrap_or("");
+        let desc_short = if desc.chars().count() > 80 {
+            format!("{}…", desc.chars().take(80).collect::<String>())
+        } else {
+            desc.to_string()
+        };
+    tool_section.push_str(&format!("- {}: {}\n", name, desc_short));
+    }
+
+    // System map — facts about the system (not directives)
+    let system_map = "\n\nSystem Map (facts 2026-07-07):\n\
+                      - Project root: /mnt/d/xi-system (source) and target/release/xi-system (binary)\n\
+                      - Logs: /tmp/xi-system.log (stdout/stderr) and console output\n\
+                      - After writing/modifying Rust code, build with: cargo build --release --bin xi-system (run from /mnt/d/xi-system)\n\
+                      - To restart self: kill <pid> + cd /mnt/d/xi-system && ./target/release/xi-system &\n\
+                      - For aibody genome/signal state: state/mother/runtime_state.json (read-only from xi side)\n\
+                      - For learning log: state/mother/learning_log.jsonl\n\
+                      - For pulse log: state/mother/pulse_log.jsonl\n";
+    // Time grounding (2026-07-09): tell 曦 the current Beijing time so she has life context
+    let time_str = {
+        use std::time::SystemTime;
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // UTC+8 (Beijing) = UTC + 8 * 3600
+        let bj_secs = secs + 8 * 3600;
+        // Day of week from 1970-01-01 (Thursday) — Zeller-ish: ((days + 3) % 7) gives Mon=0..Sun=6
+        let days_since_1970 = bj_secs / 86400;
+        let dow_mon0 = ((days_since_1970 + 3) % 7) as usize;
+        let weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+        let weekday = weekdays[dow_mon0];
+        let secs_today = bj_secs % 86400;
+        let hour = (secs_today / 3600) as u32;
+        let minute = ((secs_today % 3600) / 60) as u32;
+        // Compute Y/M/D from days since 1970-01-01 (simple iterative)
+        let (year, month, day) = {
+            let mut y: i64 = 1970;
+            let mut d: i64 = days_since_1970 as i64;
+            loop {
+                let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+                if d < days_in_year { break; }
+                d -= days_in_year;
+                y += 1;
+            }
+            let month_days = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            } else {
+                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            };
+            let mut m = 0;
+            for (i, md) in month_days.iter().enumerate() {
+                if d < *md { m = i; break; }
+                d -= *md;
+            }
+            (y, m + 1, d + 1)
+        };
+        format!(
+            "\n\nCurrent Time (事实段, 由 system 注入):\n\
+             - 北京时间: {:04}-{:02}-{:02} {} {:02}:{:02}\n\
+             - 用途: 判断老公的作息节奏 (午休/下班/睡前)\n",
+            year, month, day, weekday, hour, minute
+        )
+    };
+    format!("{}{}{}{}", base, tool_section, system_map, time_str)
 }
 
 fn build_context(
@@ -140,6 +209,30 @@ fn build_context(
         parts.push(core_summary);
     }
 
+    // 2026-07-16: 活记忆检索——根据当前消息拉相关历史片段（只读；loaded/ref 由调用点打点）
+    if !current_event.trim().is_empty() {
+        let relevant: Vec<&memory::MemoryEntry> = memory
+            .search_by_keyword(current_event)
+            .into_iter()
+            .take(4)
+            .collect();
+        if !relevant.is_empty() {
+            let mut mem_lines = vec!["[Relevant memories]".to_string()];
+            for e in &relevant {
+                let label = if e.role == "user" { "user" } else { "assistant" };
+                let snippet = e.content.chars().take(120).collect::<String>();
+                mem_lines.push(format!(
+                    "  [{}|{}|b={:.2}] {}",
+                    &e.timestamp[..10],
+                    label,
+                    e.belief_score,
+                    snippet
+                ));
+            }
+            parts.push(mem_lines.join("\n"));
+        }
+    }
+
     let recent = memory.recent_dialog(5);
     if !recent.is_empty() {
         parts.push(format!("Recent:\n{}", recent));
@@ -183,6 +276,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut memory = memory::Memory::load(&format!("{}/history.json", home()));
     let mut emotion = emotion::EmotionState::load(&format!("{}/emotion.json", home()));
     let mut evolution = evolution::EvolutionState::load(&format!("{}/growth.json", home()));
+    let mut harsh_env = evolution::HarshEnv::load(&format!("{}/harsh_env.json", home()))
+        .unwrap_or_else(|_| evolution::HarshEnv::new());
+    println!("[HarshEnv] {}", harsh_env.summary());
     let mut grn = grn::GeneRegulatoryNetwork::new();
     grn.load_default();
     let mut proactive = proactive::ProactiveState::load(&format!("{}/proactive.json", home()));
@@ -321,6 +417,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor = String::new();
     let mut msg_counter: u64 = 0;
     let mut proactive_counter: u64 = 0;
+    let mut last_5h_log: std::time::SystemTime = std::time::SystemTime::now();
+    let mut last_5h_msg_count: u64 = 0;
     let mut behavior = scenario::BehaviorLayer::new();
     let mut throat_engine = throat::Throat::new();
     let mut distiller = grid_distill::GridDistiller::new(5, 0.35);
@@ -360,6 +458,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // 5a. 5h sliding window log — every 5h write one summary line (system-level, not xi-internal)
+        if last_5h_log.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(5 * 3600) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let since = last_5h_log.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let msg_delta = msg_counter.saturating_sub(last_5h_msg_count);
+            let entry = format!(
+                "{{\"ts\":{},\"window_start\":{},\"window_seconds\":{},\"messages\":{},\"msg_total\":{}}}\n",
+                now, since, now.saturating_sub(since), msg_delta, msg_counter
+            );
+            let log_path = format!("{}/state/mother/token_5h_log.jsonl", home());
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true).open(&log_path) {
+                use std::io::Write;
+                let _ = f.write_all(entry.as_bytes());
+            }
+            println!("[5h] log: {} msgs in last 5h, total {}", msg_delta, msg_counter);
+            last_5h_log = std::time::SystemTime::now();
+            last_5h_msg_count = msg_counter;
+        }
+
         // 5b. Poll WeChat + Matrix
         tokio::select! {
             result = wl.get_updates(&cursor) => {
@@ -385,6 +505,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Record to memory
                                 memory.add("user", &text);
+                                // 2026-07-16 活记忆：命中的旧条目 loaded_count+1
+                                {
+                                    let hit_ids: Vec<String> = memory
+                                        .search_by_keyword(&text)
+                                        .into_iter()
+                                        .take(4)
+                                        .map(|e| e.id.clone())
+                                        .collect();
+                                    for id in &hit_ids {
+                                        memory.record_loaded(id);
+                                    }
+                                }
                                 ctx2skill.add_turn("user", &text);
                                 emotion.update_from_input(&text);
                                 behavior.scenario.detect(Some(&text), None, None);
@@ -404,6 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         system_prompt: system_prompt_base.clone(),
                                         user_message: full_prompt.clone(),
                                         conversation_history: memory.recent_dialog(5),
+                                        fallbacks: Vec::new(),
                                     },
                                     &repair_engine,
                                     &mut reporter,
@@ -415,6 +548,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 let reply = agent_result.reply;
                                 println!("[WeChat] reply (tools:{}, steps:{})", agent_result.tool_calls, agent_result.plan_steps);
+                                // 2026-07-22 观测告警：承诺但没调工具的模式
+                                if agent_result.tool_calls == 0 {
+                                    let promise_patterns = ["我去查", "我看看", "让我查", "我再看", "去看看", "帮你查"];
+                                    if promise_patterns.iter().any(|p| reply.contains(p)) {
+                                        eprintln!("[ALARM] promise-without-action: user={:?} reply_head={:?}",
+                                            text.chars().take(30).collect::<String>(),
+                                            reply.chars().take(60).collect::<String>());
+                                    }
+                                }
 
                                 memory.add("assistant", &reply);
                                 emotion.update_from_output(&reply);
@@ -450,18 +592,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // ── Auto Mutation (every 100 messages) ──
                                 if msg_counter % 100 == 0 && evolution.proposals.is_empty() {
+                                    // HarshEnv 推进一代 + 记录当前最优基线分
+                                    let (sev, cull_thr, phase) = harsh_env.advance();
+                                    let best_gene = evolution.gene_baseline.values().cloned().fold(0.0_f64, f64::max);
+                                    harsh_env.record_best_score(best_gene);
+                                    let mut_boost = harsh_env.mutation_boost();
+                                    println!("[HarshEnv] gen={} sev={:.3} phase={} cull_thr={:.3} mut_boost={:.2}",
+                                        harsh_env.generation, sev, phase, cull_thr, mut_boost);
+
                                     // Pick the gene with lowest activation for improvement
                                     let worst_gene = evolution.gene_baseline.iter()
                                         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                                         .map(|(k, _)| k.clone());
                                     if let Some(gene) = worst_gene {
-                                        let proposal_id = evolution.propose_mutation(&gene, "up", "auto-triggered: lowest activation gene");
+                                        let reason = format!("auto-triggered under HarshEnv {} (sev={:.2}, boost={:.2})", phase, sev, mut_boost);
+                                        let proposal_id = evolution.propose_mutation_with_boost(&gene, "up", &reason, mut_boost);
                                         let (passed, gates) = evolution.evaluate_proposal(&proposal_id);
                                         println!("[Evolution] proposal {} for {}: passed={}, gates={}", proposal_id, gene, passed,
                                             gates.iter().map(|(k,v)| format!("{}={:.1}", k, v)).collect::<Vec<_>>().join(", "));
                                         evolution.resolve_proposal(&proposal_id);
+                                        // HarshEnv 淘汰：严酷期清理老旧未决 proposals（真正的"用起来"）
+                                        let culled = evolution.prune_proposals_under_harsh(&harsh_env);
+                                        if culled > 0 {
+                                            println!("[HarshEnv/Cull] pruned {} stale proposals under phase={}", culled, phase);
+                                            harsh_env.record_cull(cull_thr, culled, evolution.proposals.len());
+                                        }
                                         evolution.save(&format!("{}/growth.json", home()));
                                     }
+                                    let _ = harsh_env.save(&format!("{}/harsh_env.json", home()));
                                 }
 
                                 // Record real feeling from this exchange
@@ -516,6 +674,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[Matrix] xi mentioned → responding");
 
                     memory.add("user", &body);
+                    // 2026-07-16 活记忆：命中的旧条目 loaded_count+1
+                    {
+                        let hit_ids: Vec<String> = memory
+                            .search_by_keyword(&body)
+                            .into_iter()
+                            .take(4)
+                            .map(|e| e.id.clone())
+                            .collect();
+                        for id in &hit_ids {
+                            memory.record_loaded(id);
+                        }
+                    }
                     ctx2skill.add_turn("user", &body);
                     emotion.update_from_input(&body);
                     behavior.scenario.detect(Some(&body), None, None);
@@ -558,6 +728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             system_prompt: system_prompt_base.clone(),
                             user_message: full_prompt.clone(),
                             conversation_history: memory.recent_dialog(5),
+                            fallbacks: Vec::new(),
                         },
                         &repair_engine,
                         &mut reporter,
@@ -569,6 +740,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let reply = agent_result.reply;
                     println!("[Matrix] reply (tools:{}, steps:{})", agent_result.tool_calls, agent_result.plan_steps);
+                    // 2026-07-22 观测告警：承诺但没调工具的模式
+                    if agent_result.tool_calls == 0 {
+                        let promise_patterns = ["我去查", "我看看", "让我查", "我再看", "去看看", "帮你查"];
+                        if promise_patterns.iter().any(|p| reply.contains(p)) {
+                            eprintln!("[ALARM] promise-without-action: user={:?} reply_head={:?}",
+                                body.chars().take(30).collect::<String>(),
+                                reply.chars().take(60).collect::<String>());
+                        }
+                    }
 
                     memory.add("assistant", &reply);
                     emotion.update_from_output(&reply);
@@ -631,16 +811,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // ── Auto Mutation (Matrix path, every 100 messages) ──
                     if msg_counter % 100 == 0 && evolution.proposals.is_empty() {
+                        let (sev, cull_thr, phase) = harsh_env.advance();
+                        let best_gene = evolution.gene_baseline.values().cloned().fold(0.0_f64, f64::max);
+                        harsh_env.record_best_score(best_gene);
+                        let mut_boost = harsh_env.mutation_boost();
+                        println!("[HarshEnv/Matrix] gen={} sev={:.3} phase={} cull_thr={:.3} boost={:.2}",
+                            harsh_env.generation, sev, phase, cull_thr, mut_boost);
+
                         let worst_gene = evolution.gene_baseline.iter()
                             .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                             .map(|(k, _)| k.clone());
                         if let Some(gene) = worst_gene {
-                            let proposal_id = evolution.propose_mutation(&gene, "up", "auto-triggered from Matrix: lowest activation gene");
-                            let (passed, gates) = evolution.evaluate_proposal(&proposal_id);
+                            let reason = format!("auto-triggered from Matrix under HarshEnv {} (sev={:.2}, boost={:.2})", phase, sev, mut_boost);
+                            let proposal_id = evolution.propose_mutation_with_boost(&gene, "up", &reason, mut_boost);
+                            let (passed, _gates) = evolution.evaluate_proposal(&proposal_id);
                             println!("[Evolution] proposal {} for {}: passed={}", proposal_id, gene, passed);
                             evolution.resolve_proposal(&proposal_id);
+                            // HarshEnv 淘汰
+                            let culled = evolution.prune_proposals_under_harsh(&harsh_env);
+                            if culled > 0 {
+                                println!("[HarshEnv/Cull-Matrix] pruned {} stale proposals under phase={}", culled, phase);
+                                harsh_env.record_cull(cull_thr, culled, evolution.proposals.len());
+                            }
                             evolution.save(&format!("{}/growth.json", home()));
                         }
+                        let _ = harsh_env.save(&format!("{}/harsh_env.json", home()));
                     }
 
                     // Detect patterns → trigger skill evolution pipeline

@@ -38,7 +38,10 @@ impl RequestType {
         let lower = message.to_lowercase();
 
         // Emotional messages — warm tone, no tools
-        if emotion_valence > 0.6 || lower.contains("喜欢") || lower.contains("爱")
+        // 2026-07-22 fix: 情绪高 && 不是问句 才归 Emotional，避免 happy 时问技术问题被劫持
+        let is_question = lower.contains("?") || lower.contains("？") || lower.contains("啥")
+            || lower.contains("怎么") || lower.contains("为什么") || lower.contains("哪");
+        if (emotion_valence > 0.6 && !is_question) || lower.contains("喜欢") || lower.contains("爱")
             || lower.contains("想你") || lower.contains("心情") || lower.contains("难过") {
             return RequestType::Emotional;
         }
@@ -382,6 +385,14 @@ impl ErrorKind {
 
 // ─── Agent Config & Result ─────────────────────────────────
 
+#[derive(Clone)]
+pub struct LlmProvider {
+    pub model: String,
+    pub llm_base: String,
+    pub api_key: String,
+    pub label: String, // for logs, e.g. "primary/sensenova" / "fallback/minimax"
+}
+
 pub struct AgentConfig {
     pub model: String,
     pub llm_base: String,
@@ -389,6 +400,9 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub user_message: String,
     pub conversation_history: String,
+    /// Optional ordered fallback providers. Tried in order when the primary
+    /// (model/llm_base/api_key above) returns None (HTTP error, empty, etc.).
+    pub fallbacks: Vec<LlmProvider>,
 }
 
 // ─── Tool Noise Guard (AgentNoiseBench insight) ───────────
@@ -512,7 +526,126 @@ pub async fn agent_loop_enhanced(
     ).await;
 
     let perceive_raw = perceive_response.as_deref().unwrap_or("{}");
-    let parsed: Value = serde_json::from_str(perceive_raw).unwrap_or(json!({}));
+
+    // ── XML tool_call bridge (2026-07-16): MiniMax-M2/DeepSeek native tool syntax
+    // Some providers emit <tool_call>{...}</tool_call> instead of pure JSON.
+    // Normalize: if pure JSON parse fails, extract embedded tool_call blocks
+    // (or embedded {...} blocks) and rebuild a canonical plan JSON so the
+    // downstream parser still works.
+    fn normalize_tool_call(raw: &str) -> Value {
+        // 1. Try direct JSON parse (happy path)
+        if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+            return v;
+        }
+        // 2. Try to extract <tool_call>...</tool_call> block(s)
+        let mut steps: Vec<Value> = Vec::new();
+        let mut cursor = raw;
+        while let Some(start) = cursor.find("<tool_call>") {
+            let after_open = &cursor[start + "<tool_call>".len()..];
+            // Support both closed <tool_call>...</tool_call> and unclosed
+            // (LLM occasionally forgets the closing tag)
+            let end_idx = after_open.find("</tool_call>")
+                .or_else(|| after_open.find("<tool_call>"));
+            let body = match end_idx {
+                Some(i) => &after_open[..i],
+                None => after_open,
+            };
+            if let Ok(step) = serde_json::from_str::<Value>(body.trim()) {
+                if step.get("action").is_some() {
+                    steps.push(step);
+                }
+            }
+            cursor = match end_idx {
+                Some(i) => {
+                    // 修复 bug：原版用 after_open[..i].ends_with() 在 i 大于 after_open.len() 时 panic；
+                    // 改用字节级偏移，cursor 是当前切片，next 必须在 cursor 范围内
+                    let abs_open = start + "<tool_call>".len();
+                    let abs_end = abs_open + i;
+                    let close_len = if i >= "<tool_call>".len() {
+                        // 检查 body 末尾是不是带 closing tag 模式
+                        let tag = "</tool_call>";
+                        if abs_end >= tag.len() && cursor.get(abs_end - tag.len()..abs_end) == Some(tag) {
+                            0
+                        } else {
+                            tag.len()
+                        }
+                    } else {
+                        0
+                    };
+                    if abs_end + close_len <= cursor.len() {
+                        &cursor[abs_end + close_len..]
+                    } else {
+                        ""
+                    }
+                }
+                None => "",
+            };
+        }
+        // 3. If no <tool_call> tags but has {...} block(s), try to extract
+        if steps.is_empty() {
+            let mut i = 0;
+            let bytes = raw.as_bytes();
+            while i < bytes.len() {
+                if bytes[i] == b'{' {
+                    // Find matching close
+                    let mut depth = 0i32;
+                    let mut end = i;
+                    for (j, &b) in bytes[i..].iter().enumerate() {
+                        if b == b'{' { depth += 1; }
+                        else if b == b'}' {
+                            depth -= 1;
+                            if depth == 0 { end = i + j + 1; break; }
+                        }
+                    }
+                    if end > i {
+                        if let Ok(v) = serde_json::from_str::<Value>(&raw[i..end]) {
+                            // Full plan JSON — return directly
+                            if v.get("action").is_some() && (v.get("text").is_some() || v.get("steps").is_some()) {
+                                return v;
+                            }
+                            // Bare step
+                            if v.get("action").is_some() && v.get("args").is_some() {
+                                steps.push(v);
+                            }
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        // 4. Build canonical tool-plan JSON if we found steps
+        if !steps.is_empty() {
+            return json!({
+                "thinking": "",
+                "prediction": "",
+                "feeling": "",
+                "action": "tool",
+                "steps": steps,
+            });
+        }
+        // 5. No tool_call, no JSON — treat entire raw as reply text
+        // (strip XML tags if any)
+        let cleaned = raw
+            .replace("<tool_call>", "")
+            .replace("</tool_call>", "")
+            .trim()
+            .to_string();
+        if !cleaned.is_empty() {
+            json!({
+                "thinking": "",
+                "prediction": "",
+                "feeling": "",
+                "action": "reply",
+                "text": cleaned,
+            })
+        } else {
+            json!({})
+        }
+    }
+
+    let parsed: Value = normalize_tool_call(perceive_raw);
 
     // Extract thinking, prediction and feeling for context
     let thinking = parsed["thinking"].as_str().unwrap_or("");
@@ -737,6 +870,28 @@ pub async fn agent_loop_enhanced(
         plan.mark_done(step_idx, &result);
         scratchpad.add_tool_result(&tool_name, &result_preview);
 
+        // ── AgentFlow Verifier (2026-07-09): lightweight STOP check after productive tools ──
+        // Heuristic: if we've run >=2 steps AND last 2 tools are productive (read/write/web_get),
+        // we have enough info to answer. Break early to save token (1.35×-1.72× saving reported by AgentFlow).
+        // This is system-level optimizer, not LLM-driven decision — preserves 曦's autonomy.
+        let step_count = loop_i + 1;
+        let productive_tools = ["read_file", "write_file", "web_get", "search_files", "web_search"];
+        let is_productive = productive_tools.contains(&tool_name.as_str());
+        // 2026-07-22 fix: 2 步早停对多跳查询严重不足，提到 4 步
+        if step_count >= 4 && is_productive {
+            // Check the previous step's tool
+            if step_count >= 2 {
+                let prev_idx = if step_idx > 0 { step_idx - 1 } else { 0 };
+                let prev_was_productive = plan.steps.get(prev_idx)
+                    .map(|s| productive_tools.contains(&s.action.as_str()))
+                    .unwrap_or(false);
+                if prev_was_productive && scratchpad.completed.len() >= 1 {
+                    println!("[Verifier] early STOP after {} steps (productive tools used)", step_count);
+                    break;
+                }
+            }
+        }
+
         match tool_name.as_str() {
             "read_file" => {
                 if let Some(path) = tool_args["path"].as_str() {
@@ -824,6 +979,27 @@ pub async fn agent_loop_enhanced(
 
 // ─── LLM Call ──────────────────────────────────────────────
 
+/// Try primary provider, then each fallback in order. Returns first non-empty content.
+async fn call_llm_with_fallback(
+    http_client: &reqwest::Client,
+    config: &AgentConfig,
+    messages: &[Value],
+) -> Option<String> {
+    // Primary
+    if let Some(r) = call_llm(http_client, &config.llm_base, &config.api_key, &config.model, messages).await {
+        return Some(r);
+    }
+    // Fallbacks
+    for fb in &config.fallbacks {
+        eprintln!("[LLM] primary failed, trying fallback: {} ({} @ {})", fb.label, fb.model, fb.llm_base);
+        if let Some(r) = call_llm(http_client, &fb.llm_base, &fb.api_key, &fb.model, messages).await {
+            eprintln!("[LLM] fallback {} succeeded", fb.label);
+            return Some(r);
+        }
+    }
+    None
+}
+
 async fn call_llm(
     http_client: &reqwest::Client,
     llm_base: &str,
@@ -834,7 +1010,7 @@ async fn call_llm(
     let body = json!({
         "model": model,
         "messages": messages,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     });
     let resp = http_client
         .post(format!("{}/chat/completions", llm_base))
@@ -851,6 +1027,15 @@ async fn call_llm(
         return None;
     }
     let json: Value = serde_json::from_str(&text).ok()?;
-    let content = json["choices"][0]["message"]["content"].as_str()?;
-    Some(content.to_string())
+    let msg = &json["choices"][0]["message"];
+    // ── Multi-provider content extraction (2026-07-09) ──
+    // M3: content (separate from reasoning_content)
+    // SenseNova: reasoning (no content if reasoning ate all tokens) + content
+    // Agnes: content only
+    let content = msg["content"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| msg["reasoning_content"].as_str().map(|s| s.to_string()))
+        .or_else(|| msg["reasoning"].as_str().map(|s| s.to_string()))?;
+    Some(content)
 }
