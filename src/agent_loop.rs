@@ -393,6 +393,14 @@ pub struct LlmProvider {
     pub label: String, // for logs, e.g. "primary/sensenova" / "fallback/minimax"
 }
 
+/// Tier-scoped provider (v0 微内核).
+/// Optional — if empty, agent falls back to legacy primary/fallbacks flow.
+#[derive(Clone)]
+pub struct TieredProvider {
+    pub tier: crate::model_router::ModelTier,
+    pub provider: LlmProvider,
+}
+
 pub struct AgentConfig {
     pub model: String,
     pub llm_base: String,
@@ -403,6 +411,12 @@ pub struct AgentConfig {
     /// Optional ordered fallback providers. Tried in order when the primary
     /// (model/llm_base/api_key above) returns None (HTTP error, empty, etc.).
     pub fallbacks: Vec<LlmProvider>,
+    /// Optional per-tier provider list. Empty = disabled, use legacy path.
+    /// When non-empty, `call_llm_with_fallback` picks by tier first, then
+    /// falls back to primary+fallbacks if the tier provider fails.
+    pub tier_providers: Vec<TieredProvider>,
+    /// State dir for router_decisions.jsonl. Empty = don't log.
+    pub state_dir: String,
 }
 
 // ─── Tool Noise Guard (AgentNoiseBench insight) ───────────
@@ -521,8 +535,8 @@ pub async fn agent_loop_enhanced(
     }
     perceive_msgs.push(json!({"role": "user", "content": perceive_prompt}));
 
-    let perceive_response = call_llm(
-        http_client, &config.llm_base, &config.api_key, &config.model, &perceive_msgs
+    let perceive_response = call_llm_with_fallback(
+        http_client, config, &perceive_msgs, "perceive"
     ).await;
 
     let perceive_raw = perceive_response.as_deref().unwrap_or("{}");
@@ -830,8 +844,8 @@ pub async fn agent_loop_enhanced(
             }
 
             // Ask LLM what to do about the error
-            let error_response = call_llm(
-                http_client, &config.llm_base, &config.api_key, &config.model, &msgs
+            let error_response = call_llm_with_fallback(
+                http_client, config, &msgs, "error_recover"
             ).await;
 
             if let Some(err_text) = error_response {
@@ -948,8 +962,8 @@ pub async fn agent_loop_enhanced(
         thinking, feeling, scratchpad.to_context(), reply_style
     )}));
 
-    let final_reply = call_llm(
-        http_client, &config.llm_base, &config.api_key, &config.model, &msgs
+    let final_reply = call_llm_with_fallback(
+        http_client, config, &msgs, "express"
     ).await
         .unwrap_or_else(|| "我刚做完事，但不知道该说什么了".to_string());
 
@@ -979,25 +993,129 @@ pub async fn agent_loop_enhanced(
 
 // ─── LLM Call ──────────────────────────────────────────────
 
-/// Try primary provider, then each fallback in order. Returns first non-empty content.
+/// Try tier-matched provider (if any), then primary, then each fallback in order.
+/// Writes a decision record to `state_dir/router_decisions.jsonl` if state_dir set.
+/// Returns first non-empty content.
 async fn call_llm_with_fallback(
     http_client: &reqwest::Client,
     config: &AgentConfig,
     messages: &[Value],
+    role_hint: &str,
 ) -> Option<String> {
-    // Primary
-    if let Some(r) = call_llm(http_client, &config.llm_base, &config.api_key, &config.model, messages).await {
-        return Some(r);
-    }
-    // Fallbacks
-    for fb in &config.fallbacks {
-        eprintln!("[LLM] primary failed, trying fallback: {} ({} @ {})", fb.label, fb.model, fb.llm_base);
-        if let Some(r) = call_llm(http_client, &fb.llm_base, &fb.api_key, &fb.model, messages).await {
-            eprintln!("[LLM] fallback {} succeeded", fb.label);
-            return Some(r);
+    use crate::model_router::{classify_task, log_decision, iso_now, RouterDecision, estimate_cost_usd};
+
+    // Compute total prompt char count for both classification and logging.
+    let prompt_chars: usize = messages
+        .iter()
+        .map(|m| m.get("content").and_then(|v| v.as_str()).map(str::len).unwrap_or(0))
+        .sum();
+    let tier = classify_task(role_hint, prompt_chars);
+    let start = std::time::Instant::now();
+
+    // Time-grounding: inject current time as a system-tier hint if not already present.
+    // 曦 also编时间, this fixes both.
+    let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %A").to_string();
+    let time_msg = json!({
+        "role": "system",
+        "content": format!("[当前时间] {}（东八区）", now_iso)
+    });
+    let mut messages_with_time: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    messages_with_time.push(time_msg);
+    messages_with_time.extend_from_slice(messages);
+    let messages = &messages_with_time[..];
+
+    let mut picked_model = String::new();
+    let mut picked_label = String::new();
+    let mut tried_fallback = false;
+    let mut reply: Option<String> = None;
+
+    // 1) Tier-matched provider
+    if let Some(tp) = config.tier_providers.iter().find(|tp| tp.tier == tier) {
+        picked_model = tp.provider.model.clone();
+        picked_label = format!("tier/{}/{}", tier.as_str(), tp.provider.label);
+        if let Some(r) = call_llm(
+            http_client,
+            &tp.provider.llm_base,
+            &tp.provider.api_key,
+            &tp.provider.model,
+            messages,
+        )
+        .await
+        {
+            reply = Some(r);
+        } else {
+            eprintln!(
+                "[LLM] tier '{}' provider {} failed, falling back",
+                tier.as_str(),
+                tp.provider.label
+            );
+            tried_fallback = true;
         }
     }
-    None
+
+    // 2) Primary
+    if reply.is_none() {
+        if picked_model.is_empty() {
+            picked_model = config.model.clone();
+            picked_label = "primary".to_string();
+        }
+        if let Some(r) = call_llm(
+            http_client,
+            &config.llm_base,
+            &config.api_key,
+            &config.model,
+            messages,
+        )
+        .await
+        {
+            reply = Some(r);
+        } else {
+            tried_fallback = true;
+        }
+    }
+
+    // 3) Legacy fallbacks
+    if reply.is_none() {
+        for fb in &config.fallbacks {
+            eprintln!(
+                "[LLM] primary failed, trying fallback: {} ({} @ {})",
+                fb.label, fb.model, fb.llm_base
+            );
+            if let Some(r) =
+                call_llm(http_client, &fb.llm_base, &fb.api_key, &fb.model, messages).await
+            {
+                eprintln!("[LLM] fallback {} succeeded", fb.label);
+                picked_model = fb.model.clone();
+                picked_label = format!("fallback/{}", fb.label);
+                reply = Some(r);
+                break;
+            }
+        }
+    }
+
+    // 4) Log the decision (best-effort; skip if state_dir is empty)
+    if !config.state_dir.is_empty() {
+        let duration_ms = start.elapsed().as_millis();
+        let reply_chars = reply.as_ref().map(|s| s.len()).unwrap_or(0);
+        let success = reply.is_some();
+        let cost_estimate_usd = estimate_cost_usd(tier, prompt_chars, reply_chars);
+        let decision = RouterDecision {
+            ts: iso_now(),
+            role_hint,
+            tier: tier.as_str(),
+            picked_model: &picked_model,
+            picked_label: &picked_label,
+            prompt_chars,
+            duration_ms,
+            success,
+            reply_chars,
+            tried_fallback,
+            cost_estimate_usd,
+        };
+        log_decision(&config.state_dir, &decision);
+    }
+
+    reply
 }
 
 async fn call_llm(
@@ -1038,4 +1156,88 @@ async fn call_llm(
         .or_else(|| msg["reasoning_content"].as_str().map(|s| s.to_string()))
         .or_else(|| msg["reasoning"].as_str().map(|s| s.to_string()))?;
     Some(content)
+}
+
+// === TaskOutcome - 2026-07-28 shijieru ===
+// "㱨"ֻͣ"˵Ҫ"һ
+// д̣state/mother/task_outcomes.jsonl (append-only)
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum TaskStatus {
+    Done,        // 
+    Partial,     // һ
+    Blocked,     // ס/Դ
+    Failed,      // ʧ
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskOutcome {
+    pub task_id: String,
+    pub status: TaskStatus,
+    pub summary: String,            // һ仰ۣ<=200
+    pub tool_calls: usize,
+    pub plan_steps: usize,
+    pub artifacts: Vec<String>,     // ļ·
+    pub next_step: Option<String>,  // һҪʲô
+    pub ts: String,
+    pub source: String,             // "wechat" / "matrix"
+}
+
+impl TaskOutcome {
+    ///  AgentResult Զж status +  summary
+    pub fn from_agent(
+        task_id: &str,
+        agent_result: &AgentResult,
+        user_msg: &str,
+        source: &str,
+    ) -> Self {
+        let status = if !agent_result.success {
+            TaskStatus::Failed
+        } else if agent_result.tool_calls == 0 && agent_result.plan_steps == 0 {
+            TaskStatus::Partial  // 죬ûɻ
+        } else {
+            TaskStatus::Done
+        };
+
+        // summary  reply ǰ 100 ȡض
+        let reply_chars: String = agent_result.reply.chars().take(100).collect();
+        let summary = if reply_chars.is_empty() {
+            format!("[no reply] user asked: {}", user_msg.chars().take(60).collect::<String>())
+        } else {
+            reply_chars
+        };
+
+        Self {
+            task_id: task_id.to_string(),
+            status,
+            summary,
+            tool_calls: agent_result.tool_calls,
+            plan_steps: agent_result.plan_steps,
+            artifacts: Vec::new(),
+            next_step: None,
+            ts: chrono::Utc::now().to_rfc3339(),
+            source: source.to_string(),
+        }
+    }
+}
+
+/// д TaskOutcome  state/mother/task_outcomes.jsonl
+pub fn write_task_outcome(outcome: &TaskOutcome) {
+    let path = std::path::PathBuf::from(crate::HOME)
+        .join("state")
+        .join("mother")
+        .join("task_outcomes.jsonl");
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(json_line) = serde_json::to_string(outcome) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&path)
+        {
+            let _ = writeln!(f, "{}", json_line);
+        }
+    }
 }

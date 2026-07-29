@@ -79,7 +79,8 @@ fn default_id() -> String {
     format!("mem_legacy_{}", Utc::now().timestamp_micros())
 }
 
-/// Extract keywords from text (stop words removed)
+/// Extract keywords from text (stop words removed).
+/// 2026-07-16: 中文按 unicode 段切开且额外切 2-gram，避免整段中文变成单一 token。
 fn extract_keywords(text: &str) -> Vec<String> {
     let stop_words: std::collections::HashSet<&str> = [
         "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -92,48 +93,67 @@ fn extract_keywords(text: &str) -> Vec<String> {
         "each", "few", "more", "most", "other", "some", "such", "no", "nor",
         "not", "only", "own", "same", "so", "than", "too", "very", "just",
         "don", "now",
+        // 中文口语停用词
+        "的", "了", "在", "是", "我", "你", "他", "她", "它", "们", "和", "跟",
+        "也", "都", "就", "还", "又", "或", "把", "被", "让", "呢", "吧", "啊",
+        "呀", "嗯", "哦", "哈", "个", "这", "那", "有", "没", "着", "过",
     ]
     .iter()
     .cloned()
     .collect();
 
-    text.split(|c: char| {
+    let is_sep = |c: char| {
         c.is_whitespace()
-            || c == '"'
-            || c == ','
-            || c == '.'
-            || c == '!'
-            || c == '?'
-            || c == ';'
-            || c == ':'
-            || c == '('
-            || c == ')'
-            || c == '['
-            || c == ']'
-            || c == '{'
-            || c == '}'
-            || c == '#'
-            || c == '@'
-            || c == '/'
-            || c == '\\'
-            || c == '|'
-            || c == '-'
-            || c == '_'
-            || c == '+'
-            || c == '='
-            || c == '<'
-            || c == '>'
-            || c == '`'
-            || c == '~'
-            || c == '^'
-            || c == '&'
-            || c == '*'
-            || c == '\''
-    })
-    .filter(|s| !s.is_empty())
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty() && !stop_words.contains(s.as_str()))
-    .collect()
+            || matches!(
+                c,
+                '"' | ',' | '.' | '!' | '?' | ';' | ':' | '(' | ')' | '[' | ']'
+                    | '{' | '}' | '#' | '@' | '/' | '\\' | '|' | '-' | '_'
+                    | '+' | '=' | '<' | '>' | '`' | '~' | '^' | '&' | '*' | '\''
+            )
+            // 中文全角标点
+            || matches!(
+                c,
+                '，' | '。' | '！' | '？' | '；' | '：' | '（' | '）'
+                    | '「' | '」' | '『' | '』' | '【' | '】' | '《' | '》'
+                    | '“' | '”' | '‘' | '’' | '、' | '·' | '～'
+            )
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for chunk in text.split(is_sep).filter(|s| !s.is_empty()) {
+        // 判断是否含中日韩字符
+        let has_cjk = chunk.chars().any(|c| {
+            let u = c as u32;
+            (0x3400..=0x9FFF).contains(&u) || (0xF900..=0xFAFF).contains(&u)
+        });
+        if has_cjk {
+            let chars: Vec<char> = chunk.chars().collect();
+            // 单字 + 2-gram（bi-gram 是中文关键词最实用的最小切分）
+            for c in &chars {
+                let s: String = std::iter::once(*c).collect();
+                if !stop_words.contains(s.as_str()) && s.chars().any(|c| {
+                    let u = c as u32;
+                    (0x3400..=0x9FFF).contains(&u)
+                }) {
+                    out.push(s);
+                }
+            }
+            for w in chars.windows(2) {
+                let s: String = w.iter().collect();
+                out.push(s);
+            }
+        } else {
+            let low = chunk.to_lowercase();
+            if !low.is_empty() && !stop_words.contains(low.as_str()) {
+                out.push(low);
+            }
+        }
+    }
+    // 去重保序（限制单条最多 40 kw 防爆）
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|k| seen.insert(k.clone()));
+    out.truncate(40);
+    out
 }
 
 impl MemoryEntry {

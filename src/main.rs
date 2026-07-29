@@ -15,6 +15,7 @@ mod wechat;
 mod matrix_bridge;
 mod brain;
 mod ctx2soft;
+mod pi_skill_loader;
 mod organs;
 mod scenario;
 mod throat;
@@ -28,6 +29,7 @@ mod heartbeat;
 mod agent_loop;
 mod eyes;
 mod self_harness;
+mod model_router;
 
 use std::time::Duration;
 use std::time::Instant;
@@ -283,6 +285,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     grn.load_default();
     let mut proactive = proactive::ProactiveState::load(&format!("{}/proactive.json", home()));
     let mut ctx2skill = ctx2soft::Ctx2SoftState::load(&format!("{}/ctx2skill.json", home()));
+
+    // Pi-compatible skill loader (2026-07-29 · 老公读 Pi Agent 文章后授权抄的)
+    // 读 ~/.xi/skills/*/SKILL.md · YAML frontmatter + markdown body
+    // 名字冲突时原生 ctx2skill.json 永远赢 · Pi skills 只作增补
+    {
+        let existing: Vec<String> = ctx2skill.builtin_skills.keys()
+            .chain(ctx2skill.user_skills.keys())
+            .chain(ctx2skill.project_skills.keys())
+            .cloned()
+            .collect();
+        let (pi_skills, report) = pi_skill_loader::discover_pi_skills(&existing);
+        println!("[pi_skill_loader] {}", report.summary());
+        for s in pi_skills {
+            ctx2skill.user_skills.insert(s.id.clone(), s);
+        }
+    }
     let _agent_broker = broker::Broker::new();
     let repair_engine = repair::RepairEngine::new(3);
     println!("AgentCo-op: Broker (7 schemas) | Repair (max 3 retries)");
@@ -537,6 +555,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         user_message: full_prompt.clone(),
                                         conversation_history: memory.recent_dialog(5),
                                         fallbacks: Vec::new(),
+                                        tier_providers: Vec::new(),
+                                        state_dir: format!("{}/state", HOME),
                                     },
                                     &repair_engine,
                                     &mut reporter,
@@ -546,7 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &emotion,
                                 ).await;
 
-                                let reply = agent_result.reply;
+                                let reply = agent_result.reply.clone();
                                 println!("[WeChat] reply (tools:{}, steps:{})", agent_result.tool_calls, agent_result.plan_steps);
                                 // 2026-07-22 观测告警：承诺但没调工具的模式
                                 if agent_result.tool_calls == 0 {
@@ -575,6 +595,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     emotion_intensity: emotion.intensity,
                                 };
                                 crate::aibody_bridge::write_pulse_event(&conv_event);
+                                // ── Hook: task outcome (2026-07-28 诗介入) ──
+                                // 曦干完主动汇报，不再只停在"说要去干"
+                                {
+                                    let task_id = format!("wx-{}-{}", msg_counter, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+                                    let outcome = crate::agent_loop::TaskOutcome::from_agent(&task_id, &agent_result, &text, "wechat");
+                                    crate::agent_loop::write_task_outcome(&outcome);
+                                    println!("[Outcome/wechat] {:?} (tools={}, steps={})", outcome.status, outcome.tool_calls, outcome.plan_steps);
+                                }
                                 let extracted = ctx2skill.run_pipeline();
                                 if !extracted.is_empty() {
                                     println!("[WeChat] ctx2soft extracted {} new skill(s)", extracted.len());
@@ -729,6 +757,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             user_message: full_prompt.clone(),
                             conversation_history: memory.recent_dialog(5),
                             fallbacks: Vec::new(),
+                            tier_providers: Vec::new(),
+                            state_dir: format!("{}/state", HOME),
                         },
                         &repair_engine,
                         &mut reporter,
@@ -738,7 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &emotion,
                     ).await;
 
-                    let reply = agent_result.reply;
+                    let reply = agent_result.reply.clone();
                     println!("[Matrix] reply (tools:{}, steps:{})", agent_result.tool_calls, agent_result.plan_steps);
                     // 2026-07-22 观测告警：承诺但没调工具的模式
                     if agent_result.tool_calls == 0 {
@@ -767,6 +797,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         emotion_intensity: emotion.intensity,
                     };
                     crate::aibody_bridge::write_pulse_event(&conv_event);
+                    // ── Hook: task outcome (2026-07-28 诗介入) ──
+                    {
+                        let task_id = format!("mx-{}-{}", msg_counter, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+                        let outcome = crate::agent_loop::TaskOutcome::from_agent(&task_id, &agent_result, &body, "matrix");
+                        crate::agent_loop::write_task_outcome(&outcome);
+                        println!("[Outcome/matrix] {:?} (tools={}, steps={})", outcome.status, outcome.tool_calls, outcome.plan_steps);
+                    }
                     // Run skill extraction pipeline (every reply, may auto-extract patterns)
                     let extracted = ctx2skill.run_pipeline();
                     if !extracted.is_empty() {

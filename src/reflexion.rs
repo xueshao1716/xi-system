@@ -108,6 +108,10 @@ impl ReflexionLoop {
 
         if !success || self.round % 5 == 0 {
             self.reflect_on_last();
+        } else {
+            // 2026-07-16: persist every action (previously only save inside reflect_on_last,
+            // so kill-9 lost up to 5 rounds + history). Cheap: file is ~170KB.
+            self.save();
         }
     }
 
@@ -171,10 +175,13 @@ impl ReflexionLoop {
 
         if let Some(rule) = rule_candidate {
             if self.should_solidify(&last) {
-                self.rules.push(rule);
-                *self.stats.entry("rules_formed".to_string()).or_insert(0) += 1;
-                if let Some(last_reflection) = self.reflections.last_mut() {
-                    last_reflection.solidified = true;
+                // Dedup: skip if identical rule already exists (RQGM epoch hygiene 2026-07-09)
+                if !self.rules.iter().any(|r| r == &rule) {
+                    self.rules.push(rule);
+                    *self.stats.entry("rules_formed".to_string()).or_insert(0) += 1;
+                    if let Some(last_reflection) = self.reflections.last_mut() {
+                        last_reflection.solidified = true;
+                    }
                 }
             }
         }

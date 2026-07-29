@@ -159,11 +159,19 @@ pub fn build_system_prompt(
     }
     parts.push(String::new());
 
-    // 9. Tool Capabilities
+    // 9. Tool Capabilities — auto-generated from tools::tool_definitions()
     parts.push("Tool Capabilities:".to_string());
-    parts.push("- browser_fetch: fetch URLs and HTML content".to_string());
-    parts.push("- write_file: write to /mnt/d/xi-system/ (SkillRepo)".to_string());
-    parts.push("- read_file + write_file: read and modify files".to_string());
+    for tool_def in crate::tools::tool_definitions() {
+        let name = tool_def["function"]["name"].as_str().unwrap_or("?");
+        let desc = tool_def["function"]["description"].as_str().unwrap_or("");
+        // Truncate long descriptions
+        let desc_short = if desc.chars().count() > 80 {
+            format!("{}…", desc.chars().take(80).collect::<String>())
+        } else {
+            desc.to_string()
+        };
+        parts.push(format!("- {}: {}", name, desc_short));
+    }
 
     parts.join("\n")
 }

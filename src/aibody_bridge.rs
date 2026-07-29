@@ -137,6 +137,32 @@ pub fn write_learning_event(topics: &[&str], messages_count: u64, summary: &str)
     }
 }
 
+/// Bump runtime_state.json heartbeat_count and last_heartbeat (2026-07-16).
+/// Called from heartbeat loop so aibody layer can see xi is alive.
+pub fn bump_heartbeat(emotion_primary: &str) {
+    let path = state_dir().join("runtime_state.json");
+    let now = Utc::now().to_rfc3339();
+
+    let mut root: Value = match std::fs::read_to_string(&path) {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    };
+
+    let count = root.get("heartbeat_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) + 1;
+
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert("heartbeat_count".into(), json!(count));
+        obj.insert("last_heartbeat".into(), json!(now));
+        obj.insert("emotion_state".into(), json!(emotion_primary));
+    }
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write(&path, pretty);
+    }
+}
+
 fn get_last_tick(path: &PathBuf) -> u64 {
     if !path.exists() { return 0; }
     let content = match std::fs::read_to_string(path) {

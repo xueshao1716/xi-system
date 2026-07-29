@@ -125,13 +125,13 @@ fn deep_dream(episodic: &[String]) -> Option<DreamEntry> {
     let combined = window.join(" ");
     let topics = classify_topic(&combined);
 
-    // ______
+    // Emotional curve analysis
     let recent: Vec<&str> = window.iter().rev().take(5).map(|s| sentiment(s)).collect();
-    let pos_count = recent.iter().filter(|s| **s == "___").count();
-    let neg_count = recent.iter().filter(|s| **s == "___").count();
-    let curve = if pos_count > neg_count + 1 { "__" } else if neg_count > pos_count + 1 { "__" } else { "___" };
+    let pos_count = recent.iter().filter(|s| **s == "positive").count();
+    let neg_count = recent.iter().filter(|s| **s == "negative").count();
+    let curve = if pos_count > neg_count + 1 { "↗ 上扬" } else if neg_count > pos_count + 1 { "↘ 下沉" } else { "→ 平稳" };
 
-    let mut findings = vec![format!("placeholder {}", curve)];
+    let mut findings = vec![format!("情绪曲线: {}", curve)];
     if !topics.is_empty() {
         findings.push(format!("______: {}", topics.join(", ")));
     }

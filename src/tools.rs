@@ -156,7 +156,7 @@ pub async fn call_tool(name: &str, args: &serde_json::Value) -> String {
 
 // ── Shell Execution ──────────────────────────────────────────────────────────
 
-/// Execute a shell command via bash with a 30-second timeout.
+/// Execute a shell command via bash with a 120-second timeout.
 async fn cmd_exec(args: &serde_json::Value) -> String {
     let cmd = args["command"].as_str().unwrap_or("");
     if cmd.is_empty() {
@@ -164,7 +164,7 @@ async fn cmd_exec(args: &serde_json::Value) -> String {
     }
 
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(120),
         tokio::process::Command::new("bash")
             .arg("-c")
             .arg(cmd)

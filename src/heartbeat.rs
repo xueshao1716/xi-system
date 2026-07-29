@@ -26,8 +26,11 @@ pub async fn emotion_heartbeat() {
         // ___
         emotion.save(&path);
 
+        // 2026-07-16: bump runtime_state.heartbeat_count so aibody layer sees xi alive
+        crate::aibody_bridge::bump_heartbeat(&emotion.primary);
+
         println!(
-            "__ [___] ___: {} ({:.2})",
+            "[heartbeat] emotion: {} ({:.2})",
             emotion.primary, emotion.intensity
         );
     }

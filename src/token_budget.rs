@@ -241,6 +241,8 @@ mod tests {
             loaded_count: 0,
             referenced_count: 0,
             keywords: vec![],
+            belief_score: 0.5,
+            last_effective_at: None,
         }
     }
 

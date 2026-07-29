@@ -473,6 +473,9 @@ pub struct Ctx2SoftState {
     pub optimizer_endpoint: String,
     #[serde(default)]
     pub optimizer_model: String,
+    // [SkillOpt] Optimizer API key (Authorization Bearer). Empty = no auth header sent.
+    #[serde(default)]
+    pub optimizer_api_key: String,
 }
 
 impl Ctx2SoftState {
@@ -494,6 +497,7 @@ impl Ctx2SoftState {
             rejection_buffer: Vec::new(),
             optimizer_endpoint: String::new(),
             optimizer_model: String::new(),
+            optimizer_api_key: String::new(),
         }
     }
 
@@ -630,15 +634,23 @@ impl Ctx2SoftState {
             return patterns;
         }
 
-        // Pattern 1: tool query pattern
+        // Pattern 1: tool query pattern (EN + ZH)
         let tool_count = window
             .iter()
             .filter(|t| {
                 let c = t.content.to_lowercase();
+                let raw = &t.content;
                 c.contains("search")
                     || c.contains("fetch")
                     || c.contains("query")
                     || c.contains("browse")
+                    || raw.contains("查")
+                    || raw.contains("搜")
+                    || raw.contains("抓")
+                    || raw.contains("读")
+                    || raw.contains("扒")
+                    || raw.contains("看看")
+                    || raw.contains("找一下")
             })
             .count();
         if tool_count >= 3 {
@@ -648,13 +660,10 @@ impl Ctx2SoftState {
             ));
         }
 
-        // Pattern 2: repeated Q&A
+        // Pattern 2: repeated Q&A (EN + ZH)
         let pattern_keywords = [
-            "what is",
-            "how to do",
-            "can you help",
-            "please explain",
-            "tell me about",
+            "what is", "how to do", "can you help", "please explain", "tell me about",
+            "怎么", "为什么", "是什么", "帮我", "能不能", "怎么办", "什么意思",
         ];
         for kw in &pattern_keywords {
             let count = window
@@ -669,15 +678,23 @@ impl Ctx2SoftState {
             }
         }
 
-        // Pattern 3: emotional escalation
+        // Pattern 3: emotional escalation (EN + ZH)
         let emotion_count = window
             .iter()
             .filter(|t| {
                 let c = t.content.to_lowercase();
+                let raw = &t.content;
                 c.contains("frustrated")
                     || c.contains("angry")
                     || c.contains("upset")
                     || c.contains("annoyed")
+                    || raw.contains("烦")
+                    || raw.contains("急")
+                    || raw.contains("气")
+                    || raw.contains("卧槽")
+                    || raw.contains("擦")
+                    || raw.contains("崩")
+                    || raw.contains("受不了")
             })
             .count();
         if emotion_count >= 2 {
@@ -687,21 +704,52 @@ impl Ctx2SoftState {
             ));
         }
 
-        // Pattern 4 (retry): failure + retry in same window
+        // Pattern 4 (retry): failure + retry in same window (EN + ZH)
         let fail_count = window
             .iter()
             .filter(|t| {
+                let c = &t.content;
                 t.role == "user"
-                    && (t.content.contains("failed")
-                        || t.content.contains("error")
-                        || t.content.contains("try again")
-                        || t.content.contains("didn't work"))
+                    && (c.contains("failed")
+                        || c.contains("error")
+                        || c.contains("try again")
+                        || c.contains("didn't work")
+                        || c.contains("失败")
+                        || c.contains("报错")
+                        || c.contains("挂了")
+                        || c.contains("不对")
+                        || c.contains("再试")
+                        || c.contains("重来")
+                        || c.contains("还是不行"))
             })
             .count();
         if fail_count >= 2 {
             patterns.push(format!(
                 "retry_loop_pattern: {} failure/retry messages, recommend dedicated recovery skill",
                 fail_count
+            ));
+        }
+
+        // Pattern 5 (2026-07-16): user correction / preference — new
+        let correction_count = window
+            .iter()
+            .filter(|t| {
+                let c = &t.content;
+                t.role == "user"
+                    && (c.contains("不是")
+                        || c.contains("别")
+                        || c.contains("以后")
+                        || c.contains("记住")
+                        || c.contains("下次")
+                        || c.contains("我说过")
+                        || c.contains("跟你说")
+                        || c.contains("prefer"))
+            })
+            .count();
+        if correction_count >= 2 {
+            patterns.push(format!(
+                "user_correction_pattern: {} correction/preference signals",
+                correction_count
             ));
         }
 
@@ -1123,19 +1171,51 @@ impl Ctx2SoftState {
             .build()
             .ok()?;
 
-        let resp = client.post(&self.optimizer_endpoint)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .ok()?;
+        let resp = {
+            let mut req = client.post(&self.optimizer_endpoint)
+                .header("Content-Type", "application/json");
+            if !self.optimizer_api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.optimizer_api_key));
+            }
+            req.json(&payload).send().ok()?
+        };
 
         let body: serde_json::Value = resp.json().ok()?;
         let content = body["choices"][0]["message"]["content"].as_str()?;
 
-        // Parse edits from response
-        let edits: Vec<serde_json::Value> = serde_json::from_str(
-            content.trim().trim_start_matches("```json").trim_end_matches("```")
-        ).ok()?;
+        // Strip <think>...</think> reasoning block (M2/DeepSeek-R1 style)
+        let cleaned = {
+            let mut s = content.to_string();
+            while let Some(start) = s.find("<think>") {
+                if let Some(end) = s[start..].find("</think>") {
+                    s.replace_range(start..start + end + "</think>".len(), "");
+                } else {
+                    break;
+                }
+            }
+            s.trim().to_string()
+        };
+
+        // Extract first JSON array from cleaned content (handles ```json fence + trailing text)
+        let json_str = {
+            let stripped = cleaned
+                .trim()
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+            if let (Some(lb), Some(rb)) = (stripped.find('['), stripped.rfind(']')) {
+                if lb < rb {
+                    stripped[lb..=rb].to_string()
+                } else {
+                    stripped.to_string()
+                }
+            } else {
+                stripped.to_string()
+            }
+        };
+
+        let edits: Vec<serde_json::Value> = serde_json::from_str(&json_str).ok()?;
 
         if edits.is_empty() {
             return None;
