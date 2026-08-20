@@ -27,6 +27,7 @@ mod repair;
 mod agent_loop;
 mod tool_forge;
 mod risk_guard;
+mod anti_homogenization;
 mod relationship;
 mod working_memory;
 mod mother;
@@ -531,6 +532,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if TICK.load(std::sync::atomic::Ordering::Relaxed) % 10 == 0 { println!("[loop-tick] {}", TICK.load(std::sync::atomic::Ordering::Relaxed)); }
+        // 2026-08-21 反同质化接入：周期性检查进化主题分布（FSA 思想），某主题 >40% 标记该换方向
+        let tick_now = TICK.load(std::sync::atomic::Ordering::Relaxed);
+        if tick_now % 100 == 0 {
+            let stats = crate::anti_homogenization::analyze_default();
+            let flags = stats.check();
+            if !flags.is_empty() {
+                let desc: Vec<String> = flags.iter().map(|(t, p)| format!("{} {:.0}%", t, p)).collect();
+                eprintln!("[anti-homogenization] ⚠️ 同质化警告: {}（该换方向了）", desc.join(", "));
+            }
+        }
         // 2026-08-02 修复：定期向 aibody 层上报心跳（此前 bump_heartbeat 从未被调用，aibody 永远 inactive）
         if last_aibody_heartbeat.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(600) {
             let primary = emotion.primary.clone();
