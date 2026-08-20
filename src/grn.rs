@@ -298,3 +298,50 @@ mod tests {
         assert_eq!(anomalies[0].gene, "gentleness");
     }
 }
+#[cfg(test)]
+mod math_tests {
+    use super::*;
+
+    fn sig_map(intimacy: f64, novelty: f64, stress: f64, trust: f64) -> HashMap<String, f64> {
+        let mut m = HashMap::new();
+        m.insert("intimacy".into(), intimacy);
+        m.insert("novelty".into(), novelty);
+        m.insert("stress".into(), stress);
+        m.insert("trust".into(), trust);
+        m
+    }
+
+    #[test]
+    fn signal_to_expression_maps_correctly() {
+        let mut grn = GeneRegulatoryNetwork::new();
+        grn.load_default();
+        let base = crate::evolution::GeneExpression::default().to_map();
+        let signals = sig_map(0.5, 0.9, 0.1, 0.5);
+        let regulated = grn.regulate(&base, &signals, 1, 0.1);
+        assert!(regulated.get("curiosity").unwrap() > &0.5, "curiosity 应被 novelty 上调");
+        assert!(regulated.get("caution").unwrap() < &0.5, "caution 应被低 stress 压低");
+    }
+
+    #[test]
+    fn regulation_clamps_to_unit() {
+        let mut grn = GeneRegulatoryNetwork::new();
+        grn.load_default();
+        let mut map = HashMap::new();
+        map.insert("curiosity".to_string(), 1.0);
+        let out = grn.regulate(&map, &sig_map(0.5, 0.5, 0.5, 0.5), 3, 0.3);
+        for (_, v) in &out {
+            assert!((0.0..=1.0).contains(v), "调控值必须 clamp 到 [0,1]，got {}", v);
+        }
+    }
+
+    #[test]
+    fn more_iterations_stabilize() {
+        let mut grn = GeneRegulatoryNetwork::new();
+        grn.load_default();
+        let sig = sig_map(0.8, 0.6, 0.2, 0.7);
+        let base = crate::evolution::GeneExpression::default().to_map();
+        let r1 = grn.regulate(&base, &sig, 1, 0.2);
+        let r5 = grn.regulate(&base, &sig, 5, 0.2);
+        assert!(r5.get("gentleness").copied().unwrap() >= r1.get("gentleness").copied().unwrap() - 0.01);
+    }
+}
