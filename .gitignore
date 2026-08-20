@@ -76,3 +76,4 @@ node_modules/
 /*.cfg
 /*.bin
 /*.log*
+/xi-system-windows.exe
