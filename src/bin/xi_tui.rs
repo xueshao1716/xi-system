@@ -361,21 +361,30 @@ fn draw(f: &mut Frame, chat_log: &[(String, String)], input: &mut TextArea, stat
     ])).block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    // 聊天历史
-    let items: Vec<ListItem> = chat_log.iter().rev().take(30).map(|(role, text)| {
-        let content = if role == "你" {
-            Line::from(vec![Span::styled("你: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)), Span::raw(text.clone())])
+    // 聊天历史：正序（最新在底部）+ 自动换行（Paragraph + Wrap）
+    let mut msg_lines: Vec<Line> = Vec::new();
+    let visible: Vec<&(String, String)> = chat_log.iter().rev().take(30).rev().collect();
+    for (role, text) in visible {
+        let label = if role == "你" {
+            Span::styled("你: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         } else {
-            Line::from(vec![Span::styled("曦: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), Span::raw(text.clone())])
+            Span::styled("曦: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
         };
-        ListItem::new(content)
-    }).collect();
-    let chat = List::new(items).block(Block::default().borders(Borders::ALL).title(" 对话 "));
+        for (i, part) in text.split('\n').enumerate() {
+            if i == 0 {
+                msg_lines.push(Line::from(vec![label.clone(), Span::raw(part.to_string())]));
+            } else {
+                msg_lines.push(Line::from(vec![Span::raw(format!("    {}", part))]));
+            }
+        }
+        msg_lines.push(Line::from(""));
+    }
+    let chat = Paragraph::new(msg_lines).block(Block::default().borders(Borders::ALL).title(" 对话 ")).wrap(Wrap { trim: false });
     f.render_widget(chat, chunks[1]);
 
     // 状态
     let status_text = if let Some(p) = pending { format!("⏳ 思考中…（{:.30}）\n\n{}", p, status) } else { status.to_string() };
-    let st = Paragraph::new(status_text).block(Block::default().borders(Borders::ALL).title(" 曦的状态 ")).wrap(Wrap { trim: false });
+    let st = Paragraph::new(status_text).block(Block::default().borders(Borders::ALL).title(" 曦的状态 ")).wrap(Wrap { trim: false }).scroll((0, 0));
     f.render_widget(st, chunks[2]);
 
     // 输入（tui-textarea：正确处理 echo/IME）
