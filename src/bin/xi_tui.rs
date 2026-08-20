@@ -218,34 +218,45 @@ async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user
 /// 状态面板（情绪/进化/记忆/提案/纠正）
 fn build_status(home: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
-    // 情绪
-    if let Ok(e) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(format!("{}/state/emotion.json", home)).unwrap_or_default()) {
-        let valence = e["valence"].as_f64().unwrap_or(0.0);
-        let label = if valence > 0.3 { "积极" } else if valence < -0.3 { "低落" } else { "平稳" };
-        lines.push(format!("情绪: {} (valence {:.2})", label, valence));
-    } else { lines.push("情绪: 无数据".into()); }
-    // 记忆
-    if let Ok(m) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(format!("{}/state/memory.json", home)).unwrap_or_default()) {
-        let n = m["entries"].as_array().map(|a| a.len()).unwrap_or(0);
-        lines.push(format!("记忆: {} 条", n));
-    } else { lines.push("记忆: 无数据".into()); }
-    // 每日判断
+    // 核心状态：state/mother/runtime_state.json（曦 gateway 写的）
+    let rt = std::fs::read_to_string(format!("{}/state/mother/runtime_state.json", home))
+        .ok().and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
+    if let Some(rt) = &rt {
+        let emo = rt["emotion_state"].as_str().unwrap_or("?");
+        lines.push(format!("情绪: {}", emo));
+        lines.push(format!("心跳: {} 次（最近 {}）",
+            rt["heartbeat_count"].as_u64().unwrap_or(0),
+            rt["last_heartbeat"].as_str().unwrap_or("?").get(..19).unwrap_or("?")));
+    } else {
+        lines.push("状态: 无 runtime_state（gateway 未跑）".into());
+    }
+    // 情绪历史（最新一条）
+    if let Ok(content) = std::fs::read_to_string(format!("{}/state/emotion_history.jsonl", home)) {
+        if let Some(last) = content.lines().last() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(last) {
+                lines.push(format!("最近情绪: {}", v["felt"].as_str().unwrap_or("").chars().take(30).collect::<String>()));
+            }
+        }
+    }
+    // 记忆：dialogue_archive 行数 + learning_log
+    if let Ok(content) = std::fs::read_to_string(format!("{}/state/mother/dialogue_archive.jsonl", home)) {
+        lines.push(format!("对话记忆: {} 条", content.lines().count()));
+    }
+    if let Ok(content) = std::fs::read_to_string(format!("{}/state/mother/learning_log.jsonl", home)) {
+        lines.push(format!("学习日志: {} 条", content.lines().count()));
+    }
+    // 真实教训（被纠正次数）
+    if let Ok(content) = std::fs::read_to_string(format!("{}/state/mother/real_lessons.jsonl", home)) {
+        lines.push(format!("真实教训: {} 条", content.lines().count()));
+    }
+    // 每日判断（新机制，gateway 升级后有）
     if let Ok(dj) = std::fs::read_to_string(format!("{}/state/daily_judgment.json", home)) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&dj) {
             lines.push(format!("今日判断: {}", v["judgment"].as_str().unwrap_or("").chars().take(40).collect::<String>()));
         }
     }
-    // 改进提案
-    if let Ok(content) = std::fs::read_to_string(format!("{}/state/improvement_proposals.jsonl", home)) {
-        let open = content.lines().filter(|l| l.contains("\"open\"")).count();
-        lines.push(format!("改进提案: {} 条 open", open));
-    }
-    // 纠正记忆
-    if let Ok(content) = std::fs::read_to_string(format!("{}/state/corrections.jsonl", home)) {
-        let n = content.lines().filter(|l| l.contains("\"active\":true")).count();
-        lines.push(format!("纠正记忆: {} 条生效", n));
-    }
-    lines.join("\n")
+    lines.join("
+")
 }
 
 fn build_proposals(home: &str) -> String {
