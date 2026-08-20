@@ -505,6 +505,12 @@ pub async fn agent_loop_enhanced(
     let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %A").to_string();
     messages.push(json!({"role": "system", "content": format!("[当前时间] {}（东八区）", now_iso)}));
 
+    // 2026-08-21 纠正记忆注入（小语记忆体系移植）：被纠正过的事每轮注入，防再犯
+    let corr_inj = crate::correction::CorrectionMemory::new(crate::home()).injection_text(8);
+    if !corr_inj.is_empty() {
+        messages.push(json!({"role": "system", "content": corr_inj}));
+    }
+
     // Conversation history
     if !config.conversation_history.is_empty() {
         for line in config.conversation_history.lines() {

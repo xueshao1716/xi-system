@@ -29,6 +29,7 @@ mod tool_forge;
 mod risk_guard;
 mod anti_homogenization;
 mod daily_judgment;
+mod correction;
 mod relationship;
 mod working_memory;
 mod mother;
@@ -43,7 +44,7 @@ use std::io::Write;
 
 const HOME_DEFAULT: &str = "D:\\xi-system";
 static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-fn home() -> &'static str {
+pub(crate) fn home() -> &'static str {
     use std::sync::OnceLock;
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE.get_or_init(|| {
