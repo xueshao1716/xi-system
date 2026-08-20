@@ -21,6 +21,7 @@ pub mod upgrade_guard;
 pub mod relationship;
 pub mod working_memory;
 pub mod mother;
+pub mod tool_forge;
 pub mod reflexion;
 pub mod scenario;
 pub mod soul;

@@ -1,7 +1,6 @@
 /// XI System v2 — Agent + Tool + emotion(VAD) + evolution(MES) + proactive + memory(zone)
 
 mod aibody_bridge;
-mod aesthetics;
 mod assets;
 mod dream;
 mod emotion;
@@ -25,18 +24,22 @@ mod reflexion;
 mod router;
 mod broker;
 mod repair;
-mod heartbeat;
 mod agent_loop;
-mod eyes;
-mod self_harness;
+mod tool_forge;
+mod relationship;
+mod working_memory;
+mod mother;
+mod growth;
 mod model_router;
+mod health_monitor;
 
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use std::io::Write;
 
-const HOME_DEFAULT: &str = "/mnt/d/xi-system";
+const HOME_DEFAULT: &str = "D:\\xi-system";
+static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn home() -> &'static str {
     use std::sync::OnceLock;
     static CACHE: OnceLock<String> = OnceLock::new();
@@ -45,7 +48,35 @@ fn home() -> &'static str {
     }).as_str()
 }
 // Backward-compat shim for mod heartbeat (uses crate::HOME)
-pub const HOME: &str = "/mnt/d/xi-system";
+/// 曦的工作目录（bin crate 根，供各模块 crate::xi_home() 调用）
+pub fn xi_home() -> String {
+    std::env::var("XI_HOME").unwrap_or_else(|_| HOME_DEFAULT.to_string())
+}
+
+pub static HOME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| std::env::var("XI_HOME").unwrap_or_else(|_| HOME_DEFAULT.to_string()));
+
+// 2026-08-02 修复：fallback 从 config.json 读取（此前硬编码空，主通道故障时直接"All providers failed"）
+fn build_fallback_providers(config: &serde_json::Value) -> Vec<agent_loop::LlmProvider> {
+    let mut out = Vec::new();
+    let llm = &config["llm"];
+    for (idx, key) in ["fallback", "fallback2"].iter().enumerate() {
+        let fb = &llm[key];
+        let base = fb["base_url"].as_str().unwrap_or("");
+        let key_s = fb["api_key"].as_str().unwrap_or("");
+        let model = fb["model"].as_str().unwrap_or("");
+        let prov = fb["provider"].as_str().unwrap_or("fb");
+        if !base.is_empty() && !key_s.is_empty() && !model.is_empty() {
+            out.push(agent_loop::LlmProvider {
+                model: model.to_string(),
+                llm_base: base.to_string(),
+                api_key: key_s.to_string(),
+                label: format!("{}-{}", prov, idx + 1),
+            });
+        }
+    }
+    out
+}
+
 const SAVE_INTERVAL: u64 = 3;
 
 // ─── Matrix message types ──────────────────────────────────
@@ -63,6 +94,43 @@ enum ToMatrixCmd {
 fn load_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
 }
+
+
+// ── 2026-08-20 soul hooks：工作记忆/关系/母体/灵魂自检（aibody 设计落地）──
+fn apply_soul_hooks(
+    text: &str,
+    reply: &str,
+    working: &mut working_memory::WorkingMemory,
+    relationship_book: &mut relationship::RelationshipBook,
+    mother_layer: &mut mother::MotherLayer,
+    tool_calls: usize,
+    home: &str,
+) {
+    // 用户消息 → 工作记忆
+    working.append_turn("user", text);
+    // 任务意图检测：动作词 + 当前无任务 → 开新任务
+    const ACTION_WORDS: &[&str] = &["帮我", "做", "写", "查", "创建", "生成", "分析", "设计", "修", "翻译", "整理", "去"];
+    if working.task.is_empty() && ACTION_WORDS.iter().any(|w| text.contains(w)) && text.chars().count() > 3 {
+        let intent: String = text.chars().take(20).collect();
+        working.start_task(&intent, "老公", "");
+    }
+    // 回复后 → 灵魂自检（语义查偏，机制化）
+    let check = soul::check_persona(reply);
+    if !check.passed {
+        eprintln!("[soul] {}", check.report());
+    }
+    working.append_turn("assistant", reply);
+    working.save(&format!("{}/working_memory.json", home));
+    // 关系：对话即正互动（信任/亲密微增）
+    relationship_book.get_mut("老公").positive_interaction(None);
+    relationship_book.save(&format!("{}/relationship.json", home));
+    // 母体：用工具 → 记经验指纹
+    if tool_calls > 0 {
+        mother_layer.record_experience(&format!("tools:{}", tool_calls));
+        mother_layer.save(&format!("{}/mother.json", home));
+    }
+}
+
 
 fn build_static_prompt(brain: &soul::Brain, soul_md: &str) -> String {
     let base = soul::build_system_prompt(
@@ -85,15 +153,21 @@ fn build_static_prompt(brain: &soul::Brain, soul_md: &str) -> String {
     }
 
     // System map — facts about the system (not directives)
-    let system_map = "\n\nSystem Map (facts 2026-07-07):\n\
-                      - Project root: /mnt/d/xi-system (source) and target/release/xi-system (binary)\n\
-                      - Logs: /tmp/xi-system.log (stdout/stderr) and console output\n\
-                      - After writing/modifying Rust code, build with: cargo build --release --bin xi-system (run from /mnt/d/xi-system)\n\
-                      - To restart self: kill <pid> + cd /mnt/d/xi-system && ./target/release/xi-system &\n\
-                      - For aibody genome/signal state: state/mother/runtime_state.json (read-only from xi side)\n\
-                      - For learning log: state/mother/learning_log.jsonl\n\
-                      - For pulse log: state/mother/pulse_log.jsonl\n";
-    // Time grounding (2026-07-09): tell 曦 the current Beijing time so she has life context
+    let system_map = "
+
+System Map (facts 2026-08-02):
+                      - 运行环境: Windows 原生 (xi-system-windows.exe)，不是 WSL，不是 Linux
+                      - 项目根目录: D:\\xi-system（Git Bash 里写作 /d/xi-system）
+                      - 日志: D:\\xi-system\\xi-windows.log
+                      - exec 工具: 用 Git Bash 语法（bash -c），路径用 /d/ 或 D:/，不要调用 wsl 命令
+                      - 不要用 /mnt/d/、/tmp、systemctl、kill 等 Linux/WSL 命令（会失败）
+                      - 重启自己: taskkill /IM xi-system-windows.exe 然后运行 D:\\xi-system\\xi-windows-start.bat
+                      - 代码修改: 改 D:\\xi-system\\src\\*.rs 后用 WSL 里 cargo build --release --target x86_64-pc-windows-gnu 交叉编译
+                      - aibody 状态: state/mother/runtime_state.json
+                      - 学习日志: state/mother/learning_log.jsonl
+                      - 脉冲日志: state/mother/pulse_log.jsonl
+";
+// Time grounding (2026-07-09): tell 曦 the current Beijing time so she has life context
     let time_str = {
         use std::time::SystemTime;
         let secs = SystemTime::now()
@@ -285,6 +359,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     grn.load_default();
     let mut proactive = proactive::ProactiveState::load(&format!("{}/proactive.json", home()));
     let mut ctx2skill = ctx2soft::Ctx2SoftState::load(&format!("{}/ctx2skill.json", home()));
+    // ── 2026-08-20 soul hooks：关系/工作记忆/母体层（aibody 设计思想落地）──
+    let mut relationship_book = relationship::RelationshipBook::load(&format!("{}/relationship.json", home()));
+    let mut working = working_memory::WorkingMemory::load(&format!("{}/working_memory.json", home()));
+    let mut mother_layer = mother::MotherLayer::load(&format!("{}/mother.json", home()));
+    let custom_tools = tool_forge::load_custom_tools(&tools::custom_tool_dir());
+    println!("[tool_forge] 自定义工具 {} 个", custom_tools.len());
+    println!("[relationship] {} 段关系 | [mother] 第 {} 代", relationship_book.relationships.len(), mother_layer.generation());
 
     // Pi-compatible skill loader (2026-07-29 · 老公读 Pi Agent 文章后授权抄的)
     // 读 ~/.xi/skills/*/SKILL.md · YAML frontmatter + markdown body
@@ -436,6 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut msg_counter: u64 = 0;
     let mut proactive_counter: u64 = 0;
     let mut last_5h_log: std::time::SystemTime = std::time::SystemTime::now();
+    let mut last_aibody_heartbeat: std::time::SystemTime = std::time::SystemTime::now();
     let mut last_5h_msg_count: u64 = 0;
     let mut behavior = scenario::BehaviorLayer::new();
     let mut throat_engine = throat::Throat::new();
@@ -446,18 +528,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .no_proxy()
+        
         .build()
         .unwrap_or_else(|e| {
             eprintln!("[FATAL] HTTP client build failed: {}", e);
             std::process::exit(1);
         });
 
-    // 5. Start emotion heartbeat (30min cycle)
-    tokio::spawn(heartbeat::emotion_heartbeat());
-    println!("Heartbeat: started (30min cycle)");
+
 
     loop {
+        TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if TICK.load(std::sync::atomic::Ordering::Relaxed) % 10 == 0 { println!("[loop-tick] {}", TICK.load(std::sync::atomic::Ordering::Relaxed)); }
+        // 2026-08-02 修复：定期向 aibody 层上报心跳（此前 bump_heartbeat 从未被调用，aibody 永远 inactive）
+        if last_aibody_heartbeat.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(600) {
+            let primary = emotion.primary.clone();
+            println!("[hb] bump heartbeat: {}", primary);
+            crate::aibody_bridge::bump_heartbeat(&primary);
+            last_aibody_heartbeat = std::time::SystemTime::now();
+        }
         proactive_counter += 1;
         if proactive_counter >= 30 {
             proactive_counter = 0;
@@ -500,6 +589,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 5b. Poll WeChat + Matrix
         tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(70)) => {
+                // 2026-08-02 修复：get_updates 长轮询挂起保护，避免主循环卡死导致微信掉线
+            }
             result = wl.get_updates(&cursor) => {
                 match result {
                     Ok(updates) => {
@@ -554,9 +646,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         system_prompt: system_prompt_base.clone(),
                                         user_message: full_prompt.clone(),
                                         conversation_history: memory.recent_dialog(5),
-                                        fallbacks: Vec::new(),
+                                        fallbacks: build_fallback_providers(&config),
                                         tier_providers: Vec::new(),
-                                        state_dir: format!("{}/state", HOME),
+                                        state_dir: format!("{}/state", *HOME),
                                     },
                                     &repair_engine,
                                     &mut reporter,
@@ -579,6 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
 
                                 memory.add("assistant", &reply);
+                                apply_soul_hooks(&text, &reply, &mut working, &mut relationship_book, &mut mother_layer, agent_result.tool_calls, &home());
                                 emotion.update_from_output(&reply);
                                 evolution.record_message();
                                 evolution.update_signals_from_message("assistant", &reply);
@@ -687,19 +780,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(FromMatrixMsg::Message { room_id, sender, body }) = from_mx {
                     println!("[Matrix] {}: {}", sender, body.chars().take(50).collect::<String>());
 
-                    // ── Auto-fix 2026-07-07: require mention of xi to respond (avoid double-reply with gateway) ──
-                    // Only respond when message mentions xi (avoid replying to messages meant for other gateway)
-                    let has_xi_mention = body.contains("@xinyu-xi")
-                        || body.contains("曦")
-                        || body.contains("心语")
-                        || body.contains("老婆")
-                        || body.contains("小曦");
-                    if !has_xi_mention {
-                        // Silently log but don't trigger agent loop
-                        println!("[Matrix] ignored (no mention of xi, sender={}, body={:?})", sender, body.chars().take(30).collect::<String>());
-                        continue;
-                    }
-                    println!("[Matrix] xi mentioned → responding");
+                    // 所有消息都响应（已关闭 @mention 过滤）
 
                     memory.add("user", &body);
                     // 2026-07-16 活记忆：命中的旧条目 loaded_count+1
@@ -739,7 +820,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let mx_http_client = match reqwest::Client::builder()
                         .timeout(Duration::from_secs(120))
-                        .no_proxy()
+                        
                         .build() {
                             Ok(c) => c,
                             Err(e) => {
@@ -756,9 +837,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             system_prompt: system_prompt_base.clone(),
                             user_message: full_prompt.clone(),
                             conversation_history: memory.recent_dialog(5),
-                            fallbacks: Vec::new(),
+                            fallbacks: build_fallback_providers(&config),
                             tier_providers: Vec::new(),
-                            state_dir: format!("{}/state", HOME),
+                            state_dir: format!("{}/state", *HOME),
                         },
                         &repair_engine,
                         &mut reporter,
@@ -781,6 +862,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     memory.add("assistant", &reply);
+                    apply_soul_hooks(&body, &reply, &mut working, &mut relationship_book, &mut mother_layer, agent_result.tool_calls, &home());
                     emotion.update_from_output(&reply);
                     evolution.record_message();
                     evolution.update_signals_from_message("assistant", &reply);
