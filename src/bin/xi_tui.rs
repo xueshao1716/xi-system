@@ -208,6 +208,9 @@ async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user
     } else {
         soul
     };
+    // 统一记忆：读 history.json（全平台共享——微信/Matrix/TUI 同一份）
+    let mut mem = xi_system::memory::Memory::load(&format!("{}/history.json", home));
+    let recent = mem.recent_dialog(6);
     // 纠正记忆注入（防再犯）
     let corr_inj = std::fs::read_to_string(format!("{}/state/corrections.jsonl", home))
         .ok()
@@ -223,7 +226,7 @@ async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user
 ")) }
         })
         .unwrap_or_default();
-    let sys_prompt = format!(
+    let mut sys_prompt = format!(
         "{}
 
 —— 当前状态 ——
@@ -232,7 +235,12 @@ async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user
 用自然语言回复，简短真诚，按灵魂说话。",
         soul_part, ctx, corr_inj
     );
+    if !recent.trim().is_empty() {
+        sys_prompt.push_str(&format!("
 
+—— 最近对话（各平台共享记忆）——
+{}", recent));
+    }
     let body = serde_json::json!({
         "model": model,
         "messages": [
@@ -242,15 +250,23 @@ async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user
         "stream": false,
     });
     let url = format!("{}/v1/chat/completions", llm_base.trim_end_matches('/'));
-    match client.post(&url).header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await {
+    let reply = match client.post(&url).header("Authorization", format!("Bearer {}", api_key)).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             let json: serde_json::Value = resp.json().await.unwrap_or_default();
             json["choices"][0]["message"]["content"].as_str().unwrap_or("（无回复）").to_string()
         }
         Ok(resp) => format!("⚠️ 调用失败: HTTP {}", resp.status()),
         Err(e) => format!("⚠️ 网络错误: {}", e),
+    };
+    // 写回统一记忆（与微信/Matrix 同一份 history.json → 全平台相通）
+    if !reply.starts_with("⚠️") {
+        mem.add("user", user_msg);
+        mem.add("assistant", &reply);
+        let _ = mem.save(&format!("{}/history.json", home));
     }
+    reply
 }
+
 
 /// 状态面板（情绪/进化/记忆/提案/纠正）
 fn build_status(home: &str) -> String {
