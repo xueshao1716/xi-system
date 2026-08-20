@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 // 简化：不走完整 agent_loop（需 repair/reflexion 等 7 依赖），直接调 LLM 的轻量回复 + 状态注入
 // （agent_loop_enhanced 需要完整引擎上下文，TUI 里先做"直连对话+状态感知"，工具循环后续接）
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let home = std::env::var("XI_HOME").unwrap_or_else(|_| "C:/xi-home".to_string());
+    let home = std::env::var("XI_HOME").unwrap_or_else(|_| "D:/xi-system".to_string());
     // 读配置
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(format!("{}/config.json", home)).unwrap_or_else(|_| "{}".into())
@@ -35,8 +35,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = config["llm"]["model"].as_str().unwrap_or("").to_string();
 
     if llm_base.is_empty() || api_key.is_empty() {
-        eprintln!("[xi_tui] 配置缺失: 需要 {}/config.json 的 llm.base / llm.api_key / llm.model", home);
+        eprintln!("[xi_tui] 配置缺失: 需要 {}/config.json 的 llm.base_url / llm.api_key / llm.model", home);
         std::process::exit(1);
+    }
+
+    // 模型列表（/model 命令族用）：config.models 数组或从 fallback 收集
+    let mut models: Vec<serde_json::Value> = config["models"].as_array().cloned().unwrap_or_default();
+    if models.is_empty() {
+        if let Some(fb) = config["llm"]["fallback"].as_object() {
+            models.push(serde_json::json!({"name": "fallback", "base_url": fb["base_url"], "api_key": fb["api_key"], "model": fb["model"]}));
+        }
     }
 
     // 消息通道：UI 线程 → agent 线程
@@ -53,7 +61,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut status = build_status(&home);
     let mut pending: Option<String> = None; // 正在等 agent 回复的消息
 
-    let result = run_ui(&mut terminal, &mut rx, &tx, &mut chat_log, &mut input, &mut status, &mut pending, &home, &llm_base, &api_key, &model);
+    let mut llm_base = llm_base;
+    let mut api_key = api_key;
+    let mut model = model;
+    let result = run_ui(&mut terminal, &mut rx, &tx, &mut chat_log, &mut input, &mut status, &mut pending, &home, &mut llm_base, &mut api_key, &mut model, &mut models);
 
     // 恢复终端
     disable_raw_mode()?;
@@ -71,7 +82,8 @@ fn run_ui<B: Backend>(
     input: &mut String,
     status: &mut String,
     pending: &mut Option<String>,
-    home: &str, llm_base: &str, api_key: &str, model: &str,
+    home: &str, llm_base: &mut String, api_key: &mut String, model: &mut String,
+    models: &mut Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where <B as Backend>::Error: 'static
 {
@@ -101,11 +113,14 @@ where <B as Backend>::Error: 'static
                             "/status" => { *status = build_status(home); }
                             "/proposals" => { *status = build_proposals(home); }
                             "/corrections" => { *status = build_corrections(home); }
+                            _ if text.starts_with("/model") => {
+                                *status = handle_model_cmd(&text, home, llm_base, api_key, model, models);
+                            }
                             _ => {
                                 // 异步调 agent（不阻塞 UI）
                                 let tx2 = tx.clone();
                                 let q = text.clone();
-                                let (b, k, m, h) = (llm_base.to_string(), api_key.to_string(), model.to_string(), home.to_string());
+                                let (b, k, m, h) = (llm_base.clone(), api_key.clone(), model.clone(), home.to_string());
                                 std::thread::spawn(move || {
                                     let rt = tokio::runtime::Runtime::new().unwrap();
                                     let reply = rt.block_on(chat_async(&b, &k, &m, &h, &q));
@@ -123,6 +138,54 @@ where <B as Backend>::Error: 'static
         }
     }
     Ok(())
+}
+
+/// 模型命令处理：/model list | /model <name> | /model add <name> <base_url> <key> <model_id>
+fn handle_model_cmd(cmd: &str, home: &str, llm_base: &mut String, api_key: &mut String, model: &mut String, models: &mut Vec<serde_json::Value>) -> String {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    match parts.get(1).map(|s| *s) {
+        Some("list") | None => {
+            let mut out = format!("📡 当前模型: {} ({})
+可用模型:
+", model, llm_base);
+            for (i, m) in models.iter().enumerate() {
+                out.push_str(&format!("  {} {} ({})
+", i + 1, m["name"].as_str().unwrap_or("?"), m["model"].as_str().unwrap_or("?")));
+            }
+            out.push_str("用法: /model <name> 切换 | /model add <name> <base_url> <api_key> <model_id>");
+            out
+        }
+        Some("add") => {
+            if parts.len() < 6 {
+                return "用法: /model add <name> <base_url> <api_key> <model_id>".to_string();
+            }
+            let entry = serde_json::json!({
+                "name": parts[2], "base_url": parts[3], "api_key": parts[4], "model": parts[5]
+            });
+            models.push(entry);
+            // 写回 config.json 的 models 数组
+            if let Ok(content) = std::fs::read_to_string(format!("{}/config.json", home)) {
+                if let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+                    cfg["models"] = serde_json::Value::Array(models.clone());
+                    let _ = std::fs::write(format!("{}/config.json", home), serde_json::to_string_pretty(&cfg).unwrap_or_default());
+                }
+            }
+            format!("✅ 已加模型 {}（{}），用 /model {} 切换", parts[2], parts[5], parts[2])
+        }
+        Some(name) => {
+            // 切换：找 models 里 name 匹配
+            let found = models.iter().find(|m| m["name"].as_str() == Some(name)).cloned();
+            match found {
+                Some(m) => {
+                    *model = m["model"].as_str().unwrap_or(name).to_string();
+                    *llm_base = m["base_url"].as_str().unwrap_or("").to_string();
+                    *api_key = m["api_key"].as_str().unwrap_or("").to_string();
+                    format!("✅ 已切换到 {}（{}）", name, *model)
+                }
+                None => format!("❌ 没有模型 '{}'，/model list 查看", name),
+            }
+        }
+    }
 }
 
 /// 直连 LLM 对话 + 状态注入（轻量版 agent 调用；工具循环后续接 agent_loop_enhanced）
