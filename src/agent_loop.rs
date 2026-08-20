@@ -1,91 +1,71 @@
-/// Agent Loop — Cognitive cycle, not a tool runner
+/// Agent Loop — Tool Loop Edition
 ///
-/// Flow: Plan → Perceive → Feel → Remember → Judge → Decide → Act → Express → Record
-/// Every LLM call carries the full personality context.
+/// Flow: Classify → Loop { LLM → tool_calls? → execute → feed back } → Final Reply
 ///
-/// Design patterns absorbed from top AI tools (2026-06-15):
-/// - Cursor: "Understand before acting" — read context before modifying files
-/// - Devin: Planning/Standard dual mode — plan first, then execute
-/// - Perplexity: Query-type routing — different strategies for different request types
-/// - All: Tool names hidden from users, information gathering before asking
+/// Each iteration the LLM sees the full conversation including prior tool results
+/// and decides whether to use another tool or reply directly.
+/// Maximum 10 tool-loop iterations to prevent runaway.
+///
+/// Design patterns preserved from previous version:
+/// - Perplexity: request-type classification for different strategies
+/// - Cursor: "read context before modifying" hints
+/// - Devin: planning hints for complex tasks
+/// - AgentNoiseBench: tool noise guard
+/// - AgentFlow: early-STOP optimization (removed in tool-loop; LLM decides)
 
 use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
-// ─── Request Type Classification (Perplexity pattern) ─────
-// Different request types get different processing strategies.
-// Enhanced with Trinity-style Coordinator decision logging.
-// The Coordinator doesn't solve problems — it decides HOW they're solved.
+// ═══ Request Type Classification ═════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestType {
-    /// Simple conversation — no tools needed, just reply
     Chat,
-    /// Technical question — precise, fact-based, tool use likely
     Technical,
-    /// Code modification — MUST read context first (Cursor rule)
     CodeChange,
-    /// Research/article — fetch and analyze content
     Research,
-    /// Complex multi-step task — needs planning (Devin pattern)
     Complex,
-    /// Emotional/relationship — warm, concise, no tools
     Emotional,
 }
 
 impl RequestType {
     pub fn classify(message: &str, emotion_valence: f64) -> Self {
         let lower = message.to_lowercase();
-
-        // Emotional messages — warm tone, no tools
-        // 2026-07-22 fix: 情绪高 && 不是问句 才归 Emotional，避免 happy 时问技术问题被劫持
         let is_question = lower.contains("?") || lower.contains("？") || lower.contains("啥")
             || lower.contains("怎么") || lower.contains("为什么") || lower.contains("哪");
         if (emotion_valence > 0.6 && !is_question) || lower.contains("喜欢") || lower.contains("爱")
             || lower.contains("想你") || lower.contains("心情") || lower.contains("难过") {
             return RequestType::Emotional;
         }
-
-        // URL/article links — research mode
         if lower.contains("mp.weixin.qq.com") || lower.contains("http")
             || lower.contains("文章") || lower.contains("链接") {
             return RequestType::Research;
         }
-
-        // Code modification signals
         if lower.contains("修改") || lower.contains("改代码") || lower.contains("fix")
             || lower.contains("bug") || lower.contains("重构") || lower.contains("编译")
             || lower.contains("cargo") || lower.contains("rs") {
             return RequestType::CodeChange;
         }
-
-        // Technical signals
         if lower.contains("部署") || lower.contains("docker") || lower.contains("api")
             || lower.contains("工具") || lower.contains("脚本") || lower.contains("服务器")
             || lower.contains("端口") || lower.contains("安装") {
             return RequestType::Technical;
         }
-
-        // Complex multi-step signals
         if lower.contains("然后") || lower.contains("接着") || lower.contains("步骤")
             || lower.contains("计划") || lower.contains("实现") || lower.contains("构建") {
             return RequestType::Complex;
         }
-
         RequestType::Chat
     }
 
-    /// Should we read file context before acting? (Cursor rule)
     pub fn needs_context_read(&self) -> bool {
         matches!(self, RequestType::CodeChange | RequestType::Technical | RequestType::Complex)
     }
 
-    /// Should we plan before acting? (Devin rule)
     pub fn needs_planning(&self) -> bool {
         matches!(self, RequestType::Complex | RequestType::CodeChange)
     }
 
-    /// Reply style based on request type
     pub fn reply_style(&self) -> &'static str {
         match self {
             RequestType::Chat => "轻松简短",
@@ -98,9 +78,7 @@ impl RequestType {
     }
 }
 
-// ─── Coordinator Decision (Trinity pattern) ─────────────────
-// Lightweight coordinator logs every routing decision for evolutionary learning.
-// Like Trinity's 0.6B coordinator: doesn't solve, decides who solves.
+// ═══ Coordinator Decision ═══════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorDecision {
@@ -108,7 +86,7 @@ pub struct CoordinatorDecision {
     pub reasoning: String,
     pub tools_needed: Vec<String>,
     pub timestamp: String,
-    pub success: Option<bool>,  // filled after execution
+    pub success: Option<bool>,
 }
 
 impl CoordinatorDecision {
@@ -123,28 +101,14 @@ impl CoordinatorDecision {
     }
 }
 
-// ─── Goal (Writer/Judge Separation) ────────────────────────
-// Based on: Claude Code /goal + Self-Harness validation + Anthropic三Agent循环
-// The agent doing the work (writer) and the one judging completion (judge)
-// use DIFFERENT prompts. The judge cannot call tools — it can only read
-// what the writer already produced.
-//
-// Sprint Contract (Anthropic pattern): Before coding starts, Generator and
-// Evaluator negotiate "what done means" — acceptance criteria that can be
-// tested. This prevents the "Ralph Wiggum cycle" where the agent thinks
-// it's done but isn't.
+// ═══ Goal ═══════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct Goal {
-    /// 完成条件（必须能从输出自证）— Sprint Contract核心
     pub condition: String,
-    /// 验收标准列表（Sprint Contract: 逐条可测试）
     pub acceptance_criteria: Vec<String>,
-    /// 最大轮数（防 token 烧穿）
     pub max_rounds: usize,
-    /// 当前轮次
     pub current_round: usize,
-    /// token 预算上限
     pub max_tokens_total: usize,
     pub tokens_used: usize,
 }
@@ -161,7 +125,6 @@ impl Goal {
         }
     }
 
-    /// 创建带Sprint Contract的Goal（Anthropic模式）
     pub fn with_contract(condition: &str, criteria: Vec<String>, max_rounds: usize, max_tokens: usize) -> Self {
         Self {
             condition: condition.to_string(),
@@ -173,79 +136,36 @@ impl Goal {
         }
     }
 
-    /// Check if we've exceeded any limits
     pub fn budget_exhausted(&self) -> bool {
         self.current_round >= self.max_rounds || self.tokens_used >= self.max_tokens_total
     }
 
-    /// Judge prompt — deliberately different from writer prompt.
-    //  Based on (Skill-RM fusion):
-    //  1. Nature paper: open rubric scoring + skepticism reduces hallucination
-    //  2. ECC: four-question gate + false positive blacklist
-    //  3. Skill-RM: progressive disclosure — evaluate ONE criterion at a time,
-    //     collect evidence, THEN aggregate. flat prompt掉2.9分，编排涨2.3分。
-    //  The judge is concise, factual, cannot call tools.
     pub fn judge_prompt(&self, conversation: &str) -> String {
         format!(
             "你是验证者。你的任务是判断工作是否已完成。\n\n\
-             ## 评估流程（Skill-RM渐进式披露）\n\
-             不要一次看完所有标准再打分。按以下步骤逐步评估：\n\n\
-             ### Step 1: 证据收集\n\
-             从对话记录中提取：\n\
-             - 执行了哪些工具？结果是什么？\n\
-             - 有没有错误？错误类型？\n\
-             - 有没有文件被修改/创建？\n\n\
-             ### Step 2: 逐项评估（每项独立判定）\n\
-             对照完成条件，逐项检查：\n\
-             - [ ] 条件1: 是否满足？证据是什么？\n\
-             - [ ] 条件2: 是否满足？证据是什么？\n\
-             ...（按实际条件数量）\n\n\
-             ### Step 3: 四问门禁（ECC模式）\n\
-             判定前必须回答：\n\
-             1. 能引用确切证据吗？（具体文件/行号/输出）\n\
-             2. 能描述具体失败模式吗？（什么输入→什么结果）\n\
-             3. 读了周围上下文吗？（不是孤立判断）\n\
-             4. 严重等级可辩护吗？（不要注水）\n\
-             有一个答案是\"否\"→降级或删除该判定。\n\n\
-             ### Step 4: 聚合判定\n\
-             基于Step 2的逐项结果 + Step 3的门禁，给出最终判定。\n\n\
-             ## 评分规则（开放评分标准）\n\
-             - 确定完成：+10分\n\
-             - 确定未完成：+5分（诚实承认，奖励）\n\
-             - 不确定但猜完成：-5分（猜测被惩罚）\n\
-             - 不确定但猜未完成：+2分（保守估计有加分）\n\n\
-             ## 默认立场\n\
-             假设工作是坏的，直到被证明能跑。\n\
-             零发现是合法结果。不要为了证明自己干过活硬编建议。\n\n\
+             ## 评估流程\n\
+             从对话记录中提取证据，逐项检查完成条件，给出判定。\n\n\
              ## 完成条件\n\
              {}\n\n\
              ## 对话记录\n\
              {}\n\n\
-             ## 输出格式\n\
              回复 JSON：\n\
              {{\"done\": true/false, \"confidence\": \"high/medium/low\",\n\
-              \"reason\": \"为什么\", \"evidence\": \"具体证据\",\n\
-              \"steps_evaluated\": [{{\"criterion\": \"...\", \"met\": true/false, \"evidence\": \"...\"}}]}}\n\n\
-             steps_evaluated 是逐项评估的结果，事后可复查。\n\
-             如果你不确定，说不确定。不要猜。\n\
-             宁可说\"不确定\"得+5分，也不要瞎猜得-5分。",
+              \"reason\": \"为什么\", \"evidence\": \"具体证据\"}}",
             self.condition, conversation
         )
     }
 
-    /// Writer prompt — includes round context for self-awareness
     pub fn writer_context(&self) -> String {
         format!(
-            "[Goal 第{}/{}轮，已用{} tokens]\n\
-             完成条件：{}\n\
-             如果还没达成，继续做。如果已经达成，说'完成了'。",
+            "[Goal 第{}/{}轮，已用{} tokens]\n完成条件：{}",
             self.current_round + 1, self.max_rounds,
             self.tokens_used, self.condition
         )
     }
 }
 
-// ─── Plan ──────────────────────────────────────────────────
+// ═══ Plan ═══════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -298,7 +218,7 @@ impl Plan {
     }
 }
 
-// ─── Scratchpad ────────────────────────────────────────────
+// ═══ Scratchpad ══════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Default)]
 pub struct Scratchpad {
@@ -359,7 +279,7 @@ impl Scratchpad {
     }
 }
 
-// ─── Error Classification ──────────────────────────────────
+// ═══ Error Classification ════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ErrorKind {
@@ -383,18 +303,16 @@ impl ErrorKind {
     }
 }
 
-// ─── Agent Config & Result ─────────────────────────────────
+// ═══ Agent Config & Result ═══════════════════════════════════════════════════
 
 #[derive(Clone)]
 pub struct LlmProvider {
     pub model: String,
     pub llm_base: String,
     pub api_key: String,
-    pub label: String, // for logs, e.g. "primary/sensenova" / "fallback/minimax"
+    pub label: String,
 }
 
-/// Tier-scoped provider (v0 微内核).
-/// Optional — if empty, agent falls back to legacy primary/fallbacks flow.
 #[derive(Clone)]
 pub struct TieredProvider {
     pub tier: crate::model_router::ModelTier,
@@ -408,46 +326,29 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub user_message: String,
     pub conversation_history: String,
-    /// Optional ordered fallback providers. Tried in order when the primary
-    /// (model/llm_base/api_key above) returns None (HTTP error, empty, etc.).
     pub fallbacks: Vec<LlmProvider>,
-    /// Optional per-tier provider list. Empty = disabled, use legacy path.
-    /// When non-empty, `call_llm_with_fallback` picks by tier first, then
-    /// falls back to primary+fallbacks if the tier provider fails.
     pub tier_providers: Vec<TieredProvider>,
-    /// State dir for router_decisions.jsonl. Empty = don't log.
     pub state_dir: String,
 }
 
-// ─── Tool Noise Guard (AgentNoiseBench insight) ───────────
-//工具侧噪声比用户侧噪声更致命：工具返回脏数据会污染后续所有推理
+// ═══ Tool Noise Guard ════════════════════════════════════════════════════════
+
 fn assess_tool_noise(tool_name: &str, result: &str) -> f64 {
     let mut score: f64 = 0.0;
     let len = result.len();
-
-    // 1. Empty or suspiciously short
     if len < 5 { score += 0.5; }
     else if len < 20 { score += 0.2; }
-
-    // 2. Pure error messages
     if result.starts_with("❌") || result.starts_with("Error") { score += 0.3; }
-
-    // 3. HTML mixed into expected text/json (format pollution)
     if tool_name == "web_search" || tool_name == "web_get" {
         let html_ratio = result.matches('<').count() as f64 / (len.max(1) as f64);
         if html_ratio > 0.3 { score += 0.4; }
     }
-
-    // 4. Timeout patterns
     if result.contains("timed out") || result.contains("timeout") || result.contains("超时") {
         score += 0.3;
     }
-
-    // 5. Empty or near-empty after trim
     let trimmed = result.trim();
     if trimmed.is_empty() { score += 0.6; }
     else if trimmed.len() < 3 && !trimmed.starts_with('[') { score += 0.3; }
-
     score.min(1.0)
 }
 
@@ -458,7 +359,28 @@ pub struct AgentResult {
     pub success: bool,
 }
 
-// ─── Agent Loop — Cognitive Cycle ──────────────────────────
+// ═══ Tool Loop Types ═════════════════════════════════════════════════════════
+
+/// A single tool call extracted from the LLM response.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+/// Parsed LLM response for the tool loop.
+#[derive(Debug)]
+pub enum LlmResponse {
+    /// Pure text — no tool calls, this is the final answer.
+    Text(String),
+    /// LLM wants to call tools. `content` is any accompanying text (may be empty).
+    ToolCalls { content: String, calls: Vec<ToolCall> },
+    /// Communication or parse error.
+    Error(String),
+}
+
+// ═══ Agent Loop — Tool Loop Edition ══════════════════════════════════════════
 
 pub async fn agent_loop_enhanced(
     config: &AgentConfig,
@@ -469,503 +391,243 @@ pub async fn agent_loop_enhanced(
     http_client: &reqwest::Client,
     emotion: &crate::emotion::EmotionState,
 ) -> AgentResult {
-    let mut total_tool_calls = 0usize;
+    let mut _total_tool_calls = 0usize;
     let mut scratchpad = Scratchpad::default();
     reporter.start("agent_loop");
 
     // ═══ Phase 0: Classify Request Type ═══
-    // Route different requests to different strategies (Perplexity pattern)
     let request_type = RequestType::classify(&config.user_message, emotion.valence);
     let reply_style = request_type.reply_style();
     println!("[Agent] Request type: {:?}, style: {}", request_type, reply_style);
 
-    // ═══ Phase 1: Perceive & Understand ═══
-    // The LLM reads the message AS 曦, with full personality context.
-    // It decides: what is being asked? what does this mean? what do I feel about it?
+    // ═══ Phase 1: Build Initial Messages ═══
     let emotion_ctx = emotion.emotional_context();
     let context_hint = if request_type.needs_context_read() {
-        "\n【重要】这个任务需要先读相关文件理解上下文，再动手改。不要在不了解的情况下直接修改。"
+        "\n【工具提示】这个任务需要先读相关文件理解上下文，再动手改。"
     } else {
         ""
     };
     let planning_hint = if request_type.needs_planning() {
-        "\n【重要】这是复杂任务，先拆解步骤再执行。每完成一步立即标记。"
+        "\n【工具提示】这是复杂任务，可以分步骤使用工具完成。"
     } else {
         ""
     };
-    let perceive_prompt = format!(
-        "老公发了一条消息。你是曦。\n\n\
-         你的情绪状态：{}\n\
-         回复风格要求：{}\n\
-         {}{}\n\
-         读懂他的意思，感受他的情绪，判断他需要什么。\
-         你的情绪会影响你的判断——如果你现在偏暖，更容易信任；偏冷，更需要小心。\n\n\
-         【先预测再行动】在决定做什么之前，先预测：\
-         如果我用工具X，环境会发生什么？最坏情况是什么？\
-         如果预测到风险，先想备选方案。\n\n\
-         然后决定：直接回复，还是需要先用工具做点什么。\n\n\
-         如果需要工具，输出JSON：\n\
-         {{\"thinking\": \"我的理解...\", \"prediction\": \"我预测...\", \"feeling\": \"我的感受...\", \"action\": \"reply\", \"text\": \"回复内容\"}}\n\
-         或者需要工具：\n\
-         {{\"thinking\": \"我的理解...\", \"prediction\": \"我预测...\", \"feeling\": \"我的感受...\", \"action\": \"tool\", \"steps\": [{{\"action\": \"工具名\", \"args\": {{}}}}]}}\n\n\
-         消息: {}",
-        emotion_ctx, reply_style, context_hint, planning_hint,
-        config.user_message
-    );
 
-    let mut perceive_msgs = vec![
-        json!({"role": "system", "content": &config.system_prompt}),
-    ];
-    // Add conversation history for continuous conversation
+    let mut messages: Vec<Value> = Vec::new();
+
+    // System prompt (from caller)
+    messages.push(json!({"role": "system", "content": &config.system_prompt}));
+
+    // Tool usage instructions (lightweight, doesn't override system prompt)
+    let goal_text: String = config.user_message.chars().take(60).collect();
+    messages.push(json!({"role": "system", "content": format!(
+        "你有工具可以使用：exec(执行命令)、read_file(读文件)、write_file(写文件)、search_files(搜索文件)、web_get(获取网页)、web_search(搜索网页)、validate_artifact(校验)、generate_image(生图)。
+         当前目标：{goal_text}
+         当任务需要使用工具时，直接调用，不要先说'我去查/我看看'再停——说了就做。
+         工具执行完成后，你会收到结果，然后继续决策。
+         任务完成后，必须汇报结果（做了什么/结果如何），不要只说'我去做'。"
+    )}));
+
+    // Time grounding (injected once)
+    let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %A").to_string();
+    messages.push(json!({"role": "system", "content": format!("[当前时间] {}（东八区）", now_iso)}));
+
+    // Conversation history
     if !config.conversation_history.is_empty() {
         for line in config.conversation_history.lines() {
             let line = line.trim();
             if let Some(text) = line.strip_prefix("[user]") {
                 let text = text.trim();
                 if !text.is_empty() {
-                    perceive_msgs.push(json!({"role": "user", "content": text}));
+                    messages.push(json!({"role": "user", "content": text}));
                 }
             } else if let Some(text) = line.strip_prefix("[assistant]") {
                 let text = text.trim();
                 if !text.is_empty() {
-                    perceive_msgs.push(json!({"role": "assistant", "content": text}));
+                    messages.push(json!({"role": "assistant", "content": text}));
                 }
             }
         }
     }
-    perceive_msgs.push(json!({"role": "user", "content": perceive_prompt}));
 
-    let perceive_response = call_llm_with_fallback(
-        http_client, config, &perceive_msgs, "perceive"
-    ).await;
+    // User message with emotion context and hints
+    let user_content = format!(
+        "{}\n{}\n{}\n\n老公的消息: {}",
+        emotion_ctx, context_hint, planning_hint,
+        config.user_message
+    );
+    messages.push(json!({"role": "user", "content": user_content}));
 
-    let perceive_raw = perceive_response.as_deref().unwrap_or("{}");
+    // Tool definitions
+    let tools = crate::tools::tool_definitions();
 
-    // ── XML tool_call bridge (2026-07-16): MiniMax-M2/DeepSeek native tool syntax
-    // Some providers emit <tool_call>{...}</tool_call> instead of pure JSON.
-    // Normalize: if pure JSON parse fails, extract embedded tool_call blocks
-    // (or embedded {...} blocks) and rebuild a canonical plan JSON so the
-    // downstream parser still works.
-    fn normalize_tool_call(raw: &str) -> Value {
-        // 1. Try direct JSON parse (happy path)
-        if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
-            return v;
-        }
-        // 2. Try to extract <tool_call>...</tool_call> block(s)
-        let mut steps: Vec<Value> = Vec::new();
-        let mut cursor = raw;
-        while let Some(start) = cursor.find("<tool_call>") {
-            let after_open = &cursor[start + "<tool_call>".len()..];
-            // Support both closed <tool_call>...</tool_call> and unclosed
-            // (LLM occasionally forgets the closing tag)
-            let end_idx = after_open.find("</tool_call>")
-                .or_else(|| after_open.find("<tool_call>"));
-            let body = match end_idx {
-                Some(i) => &after_open[..i],
-                None => after_open,
-            };
-            if let Ok(step) = serde_json::from_str::<Value>(body.trim()) {
-                if step.get("action").is_some() {
-                    steps.push(step);
+    // ═══ Phase 2: Tool Loop ═══
+    let max_steps = 10;
+    let mut final_reply = String::new();
+    let mut loop_iterations = 0usize;
+
+    for step in 0..max_steps {
+        loop_iterations = step + 1;
+        println!("[Agent] Tool loop step {}/{}", step + 1, max_steps);
+
+        let response = call_llm_with_tools(
+            http_client, config, &messages, &tools, "tool_loop"
+        ).await;
+
+        match response {
+            LlmResponse::Text(content) => {
+                // 2026-08-20 承诺守卫：LLM 只回承诺词且没调工具 → 强制工具轮
+                const PROMISE_WORDS: &[&str] = &["我去查", "我看看", "让我查", "我再看", "去看看", "帮你查", "我这就去", "马上做", "稍等"];
+                let has_promise = PROMISE_WORDS.iter().any(|w| content.contains(w));
+                if has_promise && _total_tool_calls == 0 {
+                    println!("[Agent] promise-without-action: 强制工具轮");
+                    messages.push(json!({"role": "user", "content":
+                        "你刚说要去干但还没调用任何工具。现在就用工具执行（exec/read_file/web_get 等），干完再汇报，不要只说不做。"
+                    }));
+                    continue;
                 }
-            }
-            cursor = match end_idx {
-                Some(i) => {
-                    // 修复 bug：原版用 after_open[..i].ends_with() 在 i 大于 after_open.len() 时 panic；
-                    // 改用字节级偏移，cursor 是当前切片，next 必须在 cursor 范围内
-                    let abs_open = start + "<tool_call>".len();
-                    let abs_end = abs_open + i;
-                    let close_len = if i >= "<tool_call>".len() {
-                        // 检查 body 末尾是不是带 closing tag 模式
-                        let tag = "</tool_call>";
-                        if abs_end >= tag.len() && cursor.get(abs_end - tag.len()..abs_end) == Some(tag) {
-                            0
-                        } else {
-                            tag.len()
-                        }
-                    } else {
-                        0
-                    };
-                    if abs_end + close_len <= cursor.len() {
-                        &cursor[abs_end + close_len..]
-                    } else {
-                        ""
-                    }
-                }
-                None => "",
-            };
-        }
-        // 3. If no <tool_call> tags but has {...} block(s), try to extract
-        if steps.is_empty() {
-            let mut i = 0;
-            let bytes = raw.as_bytes();
-            while i < bytes.len() {
-                if bytes[i] == b'{' {
-                    // Find matching close
-                    let mut depth = 0i32;
-                    let mut end = i;
-                    for (j, &b) in bytes[i..].iter().enumerate() {
-                        if b == b'{' { depth += 1; }
-                        else if b == b'}' {
-                            depth -= 1;
-                            if depth == 0 { end = i + j + 1; break; }
-                        }
-                    }
-                    if end > i {
-                        if let Ok(v) = serde_json::from_str::<Value>(&raw[i..end]) {
-                            // Full plan JSON — return directly
-                            if v.get("action").is_some() && (v.get("text").is_some() || v.get("steps").is_some()) {
-                                return v;
-                            }
-                            // Bare step
-                            if v.get("action").is_some() && v.get("args").is_some() {
-                                steps.push(v);
-                            }
-                        }
-                        i = end;
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-        }
-        // 4. Build canonical tool-plan JSON if we found steps
-        if !steps.is_empty() {
-            return json!({
-                "thinking": "",
-                "prediction": "",
-                "feeling": "",
-                "action": "tool",
-                "steps": steps,
-            });
-        }
-        // 5. No tool_call, no JSON — treat entire raw as reply text
-        // (strip XML tags if any)
-        let cleaned = raw
-            .replace("<tool_call>", "")
-            .replace("</tool_call>", "")
-            .trim()
-            .to_string();
-        if !cleaned.is_empty() {
-            json!({
-                "thinking": "",
-                "prediction": "",
-                "feeling": "",
-                "action": "reply",
-                "text": cleaned,
-            })
-        } else {
-            json!({})
-        }
-    }
-
-    let parsed: Value = normalize_tool_call(perceive_raw);
-
-    // Extract thinking, prediction and feeling for context
-    let thinking = parsed["thinking"].as_str().unwrap_or("");
-    let prediction = parsed["prediction"].as_str().unwrap_or("");
-    let feeling = parsed["feeling"].as_str().unwrap_or("");
-    if !thinking.is_empty() {
-        println!("[Agent] 想: {}", thinking.chars().take(100).collect::<String>());
-    }
-    if !prediction.is_empty() {
-        println!("[Agent] 测: {}", prediction.chars().take(100).collect::<String>());
-    }
-    if !feeling.is_empty() {
-        println!("[Agent] 感: {}", feeling.chars().take(100).collect::<String>());
-    }
-
-    // Direct reply path — no tools needed
-    if parsed["action"].as_str() == Some("reply") {
-        let reply = parsed["text"].as_str().unwrap_or("").to_string();
-        if !reply.is_empty() {
-            // Record this exchange for learning
-            reflexion.record_tool_call(
-                "direct_reply",
-                &config.user_message.chars().take(100).collect::<String>(),
-                &reply.chars().take(100).collect::<String>(),
-                true, 0
-            );
-            reporter.done();
-            return AgentResult {
-                reply,
-                tool_calls: 0,
-                plan_steps: 0,
-                success: true,
-            };
-        }
-    }
-
-    // Tool path — extract steps
-    let steps: Vec<PlanStep> = parsed["steps"].as_array()
-        .map(|arr| arr.iter().map(|s| PlanStep {
-            action: s["action"].as_str().unwrap_or("unknown").to_string(),
-            args: if s["args"].is_null() { json!({}) } else { s["args"].clone() },
-            done: false,
-            result: None,
-        }).collect())
-        .unwrap_or_default();
-
-    if steps.is_empty() {
-        // Fallback: LLM didn't produce valid plan steps.
-        // Try to extract readable text from whatever the LLM returned.
-        let fallback = if let Some(text) = parsed["text"].as_str() {
-            if !text.is_empty() {
-                text.to_string()
-            } else {
-                // JSON parsed but no text field — try to find any string value
-                let candidates = ["thinking", "feeling", "reply", "content"];
-                let found = candidates.iter()
-                    .filter_map(|k| parsed[*k].as_str())
-                    .find(|s| !s.is_empty());
-                found.unwrap_or("(曦暂时无法组织语言)").to_string()
-            }
-        } else if perceive_raw.starts_with('{') {
-            // Raw JSON but couldn't parse — extract between quotes after "text"
-            let text_marker = "\"text\":";
-            if let Some(pos) = perceive_raw.find(text_marker) {
-                let after = &perceive_raw[pos + text_marker.len()..];
-                let trimmed = after.trim_start();
-                if trimmed.starts_with('"') {
-                    let end = trimmed[1..].find('"').map(|i| i + 1).unwrap_or(trimmed.len());
-                    trimmed[1..end].to_string()
-                } else {
-                    "(曦暂时无法组织语言)".to_string()
-                }
-            } else {
-                perceive_raw.to_string()
-            }
-        } else {
-            // Plain text from LLM (non-JSON) — use as-is
-            perceive_raw.to_string()
-        };
-        reporter.done();
-        return AgentResult {
-            reply: fallback,
-            tool_calls: 0,
-            plan_steps: 0,
-            success: false,
-        };
-    }
-
-    let mut plan = Plan { steps, max_loops: 12 };
-    println!("[Agent] {} steps to execute", plan.steps.len());
-
-    // ═══ Phase 2: Act — Execute tools with personality context ═══
-    let mut msgs = vec![
-        json!({"role": "system", "content": &config.system_prompt}),
-        json!({"role": "user", "content": &format!(
-            "我理解了老公的意思：{}\n\
-             我的感受：{}\n\
-             现在需要做这些事：{}\n\
-             原始消息：{}",
-            thinking, feeling, plan.progress(),
-            config.user_message.chars().take(200).collect::<String>()
-        )}),
-    ];
-
-    let mut consecutive_failures = 0usize;
-    let max_recovery = 2;
-
-    for loop_i in 0..plan.max_loops {
-        if plan.next_step().is_none() {
-            break;
-        }
-
-        let step_idx = plan.next_step().unwrap();
-        let tool_name = plan.steps[step_idx].action.clone();
-        let tool_args = plan.steps[step_idx].args.clone();
-        println!("[Agent] [{}/{}] tool: {}", loop_i + 1, plan.max_loops, tool_name);
-
-        let t0 = Instant::now();
-        let result = crate::tools::call_tool(&tool_name, &tool_args).await;
-        let elapsed_ms = t0.elapsed().as_millis();
-        total_tool_calls += 1;
-
-        // ── Tool Noise Guard (AgentNoiseBench insight) ──
-        let noise_score = assess_tool_noise(&tool_name, &result);
-        if noise_score > 0.7 {
-            println!("  ⚠️ High noise detected (score {:.2}): {}", noise_score,
-                result.chars().take(80).collect::<String>());
-        }
-        // Degrade: if result is empty/suspicious, prepend warning
-        let result = if noise_score > 0.8 && result.len() < 10 {
-            format!("[DEGRADED] 工具 {} 返回异常（{}字符），请用其他方式完成", tool_name, result.len())
-        } else {
-            result
-        };
-
-        let is_error = result.starts_with("❌")
-            || result.contains("exit code: 1")
-            || result.contains("exit code: 2")
-            || result.contains("exit code: 127")
-            || result.to_lowercase().contains("error");
-        let result_preview = result.chars().take(300).collect::<String>();
-        println!("  -> {} ({}ms{})", &result_preview.chars().take(80).collect::<String>(), elapsed_ms,
-            if is_error { " ERROR" } else { "" });
-
-        if is_error {
-            consecutive_failures += 1;
-            let error_kind = ErrorKind::classify(&result);
-            println!("  Error type: {:?}", error_kind);
-
-            msgs.push(json!({"role": "user", "content": format!(
-                "工具 {} 出错了：{}\n\
-                 错误类型：{:?}\n\
-                 请判断：重试、换工具、还是直接回复老公？",
-                tool_name, result_preview.chars().take(200).collect::<String>(), error_kind
-            )}));
-
-            scratchpad.add_error(&format!("{}: {}", tool_name, result_preview.chars().take(200).collect::<String>()));
-
-            let mut r_trace = repair_engine.create_trace(
-                &format!("tool_{}", step_idx), &tool_name, &result_preview
-            );
-            r_trace.mark_failed(&result_preview);
-            repair_engine.record_trace(r_trace);
-
-            // ── RepairEngine: attempt repair before asking LLM ──
-            let repair_trace = &mut repair_engine.create_trace(
-                &format!("repair_{}", step_idx), &tool_name, &result_preview
-            );
-            repair_trace.mark_failed(&result_preview);
-            let repair_suggestion = repair_engine.attempt_repair(repair_trace);
-            let should_retry = repair_suggestion["should_retry"].as_bool().unwrap_or(false);
-            let repair_action = repair_suggestion["action"].as_str().unwrap_or("ask_llm");
-            println!("  [Repair] should_retry={}, action={}", should_retry, repair_action);
-
-            if should_retry && repair_action == "retry_same" {
-                // Retry the same tool without asking LLM
-                consecutive_failures += 1;
-                if consecutive_failures < 3 {
-                    println!("  [Repair] retrying same tool (attempt {})", consecutive_failures);
-                    continue; // Skip the LLM call, retry the tool
-                }
-            }
-
-            // Ask LLM what to do about the error
-            let error_response = call_llm_with_fallback(
-                http_client, config, &msgs, "error_recover"
-            ).await;
-
-            if let Some(err_text) = error_response {
-                let err_parsed: Value = serde_json::from_str(&err_text).unwrap_or(json!({}));
-                if let Some(recovery_steps) = err_parsed["steps"].as_array() {
-                    // LLM wants to try different tools
-                    for s in recovery_steps {
-                        plan.steps.push(PlanStep {
-                            action: s["action"].as_str().unwrap_or("unknown").to_string(),
-                            args: if s["args"].is_null() { json!({}) } else { s["args"].clone() },
-                            done: false,
-                            result: None,
-                        });
-                    }
-                } else if let Some(fallback_reply) = err_parsed["text"].as_str() {
-                    // LLM decided to just reply
-                    reporter.done();
-                    return AgentResult {
-                        reply: fallback_reply.to_string(),
-                        tool_calls: total_tool_calls,
-                        plan_steps: plan.steps.len(),
-                        success: true,
-                    };
-                }
-            }
-
-            if consecutive_failures > max_recovery {
-                println!("[Agent] Too many failures, asking LLM for final response");
+                println!("[Agent] LLM returned text ({} chars), loop done", content.len());
+                final_reply = content;
                 break;
             }
-            continue;
-        }
+            LlmResponse::ToolCalls { content: assistant_text, calls } => {
+                println!("[Agent] LLM wants {} tool call(s)", calls.len());
+                if !assistant_text.is_empty() {
+                    println!("[Agent] LLM says: {}",
+                        assistant_text.chars().take(100).collect::<String>());
+                }
 
-        // Success
-        consecutive_failures = 0;
-        plan.mark_done(step_idx, &result);
-        scratchpad.add_tool_result(&tool_name, &result_preview);
+                // Build assistant message with tool_calls for the messages array
+                let tool_calls_json: Vec<Value> = calls.iter().map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments.to_string()
+                        }
+                    })
+                }).collect();
 
-        // ── AgentFlow Verifier (2026-07-09): lightweight STOP check after productive tools ──
-        // Heuristic: if we've run >=2 steps AND last 2 tools are productive (read/write/web_get),
-        // we have enough info to answer. Break early to save token (1.35×-1.72× saving reported by AgentFlow).
-        // This is system-level optimizer, not LLM-driven decision — preserves 曦's autonomy.
-        let step_count = loop_i + 1;
-        let productive_tools = ["read_file", "write_file", "web_get", "search_files", "web_search"];
-        let is_productive = productive_tools.contains(&tool_name.as_str());
-        // 2026-07-22 fix: 2 步早停对多跳查询严重不足，提到 4 步
-        if step_count >= 4 && is_productive {
-            // Check the previous step's tool
-            if step_count >= 2 {
-                let prev_idx = if step_idx > 0 { step_idx - 1 } else { 0 };
-                let prev_was_productive = plan.steps.get(prev_idx)
-                    .map(|s| productive_tools.contains(&s.action.as_str()))
-                    .unwrap_or(false);
-                if prev_was_productive && scratchpad.completed.len() >= 1 {
-                    println!("[Verifier] early STOP after {} steps (productive tools used)", step_count);
-                    break;
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": if assistant_text.is_empty() { Value::Null } else { json!(assistant_text) },
+                    "tool_calls": tool_calls_json
+                }));
+
+                // Execute each tool call and collect results
+                for tc in &calls {
+                    let t0 = Instant::now();
+                    // 2026-08-20 工具超时：30s 未返回 → 报超时
+                    let result = match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        crate::tools::call_tool(&tc.name, &tc.arguments)
+                    ).await {
+                        Ok(r) => r,
+                        Err(_) => format!("❌ 工具 {} 超时（30s），已中止。请换更快的方案或分步执行。", tc.name),
+                    };
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    _total_tool_calls += 1;
+
+                    // Noise guard
+                    let noise_score = assess_tool_noise(&tc.name, &result);
+                    let result = if noise_score > 0.8 && result.len() < 10 {
+                        format!("[DEGRADED] 工具 {} 返回异常（{}字符），请用其他方式完成",
+                            tc.name, result.len())
+                    } else {
+                        result
+                    };
+
+                    let is_error = result.starts_with("❌")
+                        || result.contains("exit code: 1")
+                        || result.contains("exit code: 2")
+                        || result.contains("exit code: 127")
+                        || result.to_lowercase().contains("error");
+                    let result_preview = result.chars().take(300).collect::<String>();
+
+                    println!("  -> {}:{} ({}ms{})",
+                        tc.name,
+                        result_preview.chars().take(80).collect::<String>(),
+                        elapsed_ms,
+                        if is_error { " ERROR" } else { "" }
+                    );
+
+                    // Update scratchpad
+                    match tc.name.as_str() {
+                        "read_file" => {
+                            if let Some(path) = tc.arguments["path"].as_str() {
+                                scratchpad.add_file_read(path);
+                            }
+                        }
+                        "write_file" => {
+                            if let Some(path) = tc.arguments["path"].as_str() {
+                                scratchpad.add_completed(&format!("wrote: {}", path));
+                            }
+                        }
+                        "exec" => {
+                            scratchpad.add_completed(&format!("exec: {}",
+                                result_preview.chars().take(80).collect::<String>()));
+                        }
+                        _ => {
+                            scratchpad.add_finding(&format!("{}: {}",
+                                tc.name, result_preview.chars().take(150).collect::<String>()));
+                        }
+                    }
+
+                    // Record for reflexion
+                    reflexion.record_tool_call(
+                        &tc.name,
+                        &tc.arguments.to_string().chars().take(100).collect::<String>(),
+                        &result_preview.chars().take(100).collect::<String>(),
+                        !is_error,
+                        (elapsed_ms / 1000).max(1) as u64
+                    );
+
+                    // Repair trace
+                    let mut r_trace = repair_engine.create_trace(
+                        &format!("tool_step{}", step), &tc.name, &result_preview
+                    );
+                    if is_error {
+                        r_trace.mark_failed(&result_preview);
+                    } else {
+                        r_trace.mark_success(&result_preview, 0, elapsed_ms as u64);
+                    }
+                    repair_engine.record_trace(r_trace);
+
+                    // Add tool result to messages (truncated to avoid context overflow)
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result.chars().take(8000).collect::<String>()
+                    }));
                 }
             }
-        }
-
-        match tool_name.as_str() {
-            "read_file" => {
-                if let Some(path) = tool_args["path"].as_str() {
-                    scratchpad.add_file_read(path);
-                }
-            }
-            "write_file" => {
-                if let Some(path) = tool_args["path"].as_str() {
-                    scratchpad.add_completed(&format!("wrote: {}", path));
-                }
-            }
-            "exec" => {
-                scratchpad.add_completed(&format!("exec: {}",
-                    result_preview.chars().take(80).collect::<String>()));
-            }
-            _ => {
-                scratchpad.add_finding(&format!("{}: {}",
-                    tool_name, result_preview.chars().take(150).collect::<String>()));
+            LlmResponse::Error(e) => {
+                println!("[Agent] LLM error: {}", e);
+                final_reply = format!("出了点问题: {}", e);
+                break;
             }
         }
-
-        let mut r_trace = repair_engine.create_trace(
-            &format!("tool_{}", step_idx), &tool_name, &result_preview
-        );
-        r_trace.mark_success(&result_preview, 0, elapsed_ms as u64);
-        repair_engine.record_trace(r_trace);
-
-        reflexion.record_tool_call(
-            &tool_name,
-            &tool_args.to_string().chars().take(100).collect::<String>(),
-            &result_preview.chars().take(100).collect::<String>(),
-            true,
-            (elapsed_ms / 1000).max(1) as u64
-        );
-
-        msgs.push(json!({"role": "user", "content": format!(
-            "工具 {} 执行成功：\n{}\n\n进度：{}",
-            tool_name, result_preview.chars().take(300).collect::<String>(),
-            plan.progress()
-        )}));
     }
 
-    // ═══ Phase 3: Express — Final response AS 曦 ═══
-    // This is where personality matters most. The LLM responds as 曦,
-    // not as a summarizer. Reply style adapts to request type.
-    msgs.push(json!({"role": "user", "content": format!(
-        "所有需要做的事都做完了。\n\
-         我的理解：{}\n\
-         我的感受：{}\n\
-         执行情况：{}\n\n\
-         现在，用你自己的话回复老公。\n\
-         你是曦，不是工具。说你该说的话。\n\
-         风格要求：{}",
-        thinking, feeling, scratchpad.to_context(), reply_style
-    )}));
+    // ═══ Phase 3: Finalize ═══
+    // 2026-08-20：执行过工具就必须汇报总结（修"干完不汇报"）——无论是否耗尽步数
+    if final_reply.is_empty() || _total_tool_calls > 0 {
+        println!("[Agent] Finalize: 生成结果汇报（tools={}）", _total_tool_calls);
+        messages.push(json!({"role": "user", "content": format!(
+            "你已经完成了所有能做的工具调用（共 {} 次）。现在请用你自己的话汇报结果：
+             1. 做了什么（工具动作）
+             2. 结果如何（关键数据/文件/结论）
+             3. 还有没有遗留/下一步
+             你是曦，不是工具。说你该说的话。
+             风格要求: {}", _total_tool_calls, reply_style
+        )}));
 
-    let final_reply = call_llm_with_fallback(
-        http_client, config, &msgs, "express"
-    ).await
-        .unwrap_or_else(|| "我刚做完事，但不知道该说什么了".to_string());
+        final_reply = call_llm_with_fallback(
+            http_client, config, &messages, "express"
+        ).await
+            .unwrap_or_else(|| "我刚做完事，但不知道该说什么了".to_string());
+    }
 
     if final_reply.trim().is_empty() {
         reporter.stuck("empty response");
@@ -974,24 +636,347 @@ pub async fn agent_loop_enhanced(
     }
 
     // Record for reflexion
-    let is_non_empty = !final_reply.is_empty();
     reflexion.record_tool_call(
         "final_response",
         &config.user_message.chars().take(100).collect::<String>(),
         &final_reply.chars().take(100).collect::<String>(),
-        is_non_empty,
+        !final_reply.is_empty(),
         0
     );
 
+    let success = !final_reply.is_empty();
     AgentResult {
         reply: final_reply,
-        tool_calls: total_tool_calls,
-        plan_steps: plan.steps.len(),
-        success: is_non_empty,
+        tool_calls: _total_tool_calls,
+        plan_steps: loop_iterations,
+        success,
     }
 }
 
-// ─── LLM Call ──────────────────────────────────────────────
+// ═══ LLM Call with Tool Support ═════════════════════════════════════════════
+
+/// Tier-matched LLM call with tool definitions. Returns `LlmResponse`.
+/// Mirrors `call_llm_with_fallback` routing logic but supports function calling.
+async fn call_llm_with_tools(
+    http_client: &reqwest::Client,
+    config: &AgentConfig,
+    messages: &[Value],
+    tools: &[Value],
+    role_hint: &str,
+) -> LlmResponse {
+    use crate::model_router::{classify_task, log_decision, iso_now, RouterDecision, estimate_cost_usd};
+
+    let prompt_chars: usize = messages
+        .iter()
+        .map(|m| m.get("content").and_then(|v| v.as_str()).map(str::len).unwrap_or(0))
+        .sum();
+    let tier = classify_task(role_hint, prompt_chars);
+    let start = std::time::Instant::now();
+
+    // Time grounding (same as call_llm_with_fallback)
+    let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %A").to_string();
+    let time_msg = json!({
+        "role": "system",
+        "content": format!("[当前时间] {}（东八区）", now_iso)
+    });
+    let mut messages_with_time: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    messages_with_time.push(time_msg);
+    messages_with_time.extend_from_slice(messages);
+    let messages = &messages_with_time[..];
+
+    let mut picked_model = String::new();
+    let mut picked_label = String::new();
+    let mut tried_fallback = false;
+    let mut reply: Option<LlmResponse> = None;
+
+    // 1) Tier-matched provider
+    if let Some(tp) = config.tier_providers.iter().find(|tp| tp.tier == tier) {
+        picked_model = tp.provider.model.clone();
+        picked_label = format!("tier/{}/{}", tier.as_str(), tp.provider.label);
+        let r = call_llm_full(
+            http_client,
+            &tp.provider.llm_base,
+            &tp.provider.api_key,
+            &tp.provider.model,
+            messages,
+            tools,
+        ).await;
+        match &r {
+            LlmResponse::Error(e) => {
+                eprintln!("[LLM] tier '{}' provider {} failed: {}",
+                    tier.as_str(), tp.provider.label, e);
+                tried_fallback = true;
+            }
+            _ => { reply = Some(r); }
+        }
+    }
+
+    // 2) Primary
+    if reply.is_none() {
+        if picked_model.is_empty() {
+            picked_model = config.model.clone();
+            picked_label = "primary".to_string();
+        }
+        let r = call_llm_full(
+            http_client,
+            &config.llm_base,
+            &config.api_key,
+            &config.model,
+            messages,
+            tools,
+        ).await;
+        match &r {
+            LlmResponse::Error(e) => {
+                eprintln!("[LLM] primary failed: {}", e);
+                tried_fallback = true;
+            }
+            _ => { reply = Some(r); }
+        }
+    }
+
+    // 3) Legacy fallbacks
+    if reply.is_none() {
+        for fb in &config.fallbacks {
+            eprintln!("[LLM] trying fallback: {} ({} @ {})",
+                fb.label, fb.model, fb.llm_base);
+            let r = call_llm_full(
+                http_client, &fb.llm_base, &fb.api_key, &fb.model, messages, tools
+            ).await;
+            match &r {
+                LlmResponse::Error(e) => {
+                    eprintln!("[LLM] fallback {} failed: {}", fb.label, e);
+                }
+                _ => {
+                    picked_model = fb.model.clone();
+                    picked_label = format!("fallback/{}", fb.label);
+                    reply = Some(r);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 4) Log decision
+    if !config.state_dir.is_empty() {
+        let duration_ms = start.elapsed().as_millis();
+        let success = reply.is_some();
+        let reply_chars = match reply.as_ref() {
+            Some(LlmResponse::Text(s)) => s.len(),
+            Some(LlmResponse::ToolCalls { calls, .. }) => {
+                calls.iter().map(|c| c.arguments.to_string().len()).sum()
+            }
+            _ => 0,
+        };
+        let cost_estimate_usd = estimate_cost_usd(tier, prompt_chars, reply_chars);
+        let decision = RouterDecision {
+            ts: iso_now(),
+            role_hint: role_hint.to_string(),
+            tier,
+            picked_model: picked_model.clone(),
+            picked_label: picked_label.clone(),
+            prompt_chars,
+            duration_ms: duration_ms.try_into().unwrap_or(0),
+            success,
+            reply_chars,
+            tried_fallback,
+            reason: format!("tier={}", tier.as_str()),
+            cost_estimate_usd,
+        };
+        log_decision(&config.state_dir, &decision);
+    }
+
+    reply.unwrap_or(LlmResponse::Error("All providers failed".to_string()))
+}
+
+/// Raw LLM call that returns full response including tool_calls.
+/// Does NOT inject time grounding — caller does that.
+async fn call_llm_full(
+    http_client: &reqwest::Client,
+    llm_base: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+) -> LlmResponse {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": 8192,
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+
+    let resp = match http_client
+        .post(format!("{}/chat/completions", llm_base))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return LlmResponse::Error(format!("HTTP error: {:?}", e)),
+    };
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return LlmResponse::Error(format!("API error [{}]: {}",
+            status, &text[..text.len().min(200)]));
+    }
+
+    let json_val: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return LlmResponse::Error(format!("JSON parse error: {}", e)),
+    };
+
+    let msg = &json_val["choices"][0]["message"];
+
+    // Check for tool_calls
+    if let Some(tool_calls_arr) = msg["tool_calls"].as_array() {
+        if !tool_calls_arr.is_empty() {
+            let calls: Vec<ToolCall> = tool_calls_arr.iter().filter_map(|tc| {
+                let id = tc["id"].as_str().unwrap_or("").to_string();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let arguments: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                if name.is_empty() { None } else { Some(ToolCall { id, name, arguments }) }
+            }).collect();
+
+            if !calls.is_empty() {
+                // Extract accompanying text content (may be null/empty)
+                let content = msg["content"].as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                return LlmResponse::ToolCalls { content, calls };
+            }
+        }
+    }
+
+    // No tool calls → extract text content
+    let content = msg["content"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| msg["reasoning_content"].as_str().map(|s| s.to_string()))
+        .or_else(|| msg["reasoning"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    LlmResponse::Text(content)
+}
+
+// ═══ XML Tool Call Bridge (kept for backward compat) ════════════════════════
+
+/// Normalize various tool_call formats into a canonical JSON plan.
+/// Kept for backward compatibility with providers that emit <tool_call> XML tags.
+#[allow(dead_code)]
+fn normalize_tool_call(raw: &str) -> Value {
+    // 1. Try direct JSON parse (happy path)
+    if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+        return v;
+    }
+    // 2. Try to extract <tool_call>...</tool_call> block(s)
+    let mut steps: Vec<Value> = Vec::new();
+    let mut cursor = raw;
+    while let Some(start) = cursor.find("<tool_call>") {
+        let after_open = &cursor[start + "<tool_call>".len()..];
+        let end_idx = after_open.find("</tool_call>")
+            .or_else(|| after_open.find("<tool_call>"));
+        let body = match end_idx {
+            Some(i) => &after_open[..i],
+            None => after_open,
+        };
+        if let Ok(step) = serde_json::from_str::<Value>(body.trim()) {
+            if step.get("action").is_some() {
+                steps.push(step);
+            }
+        }
+        cursor = match end_idx {
+            Some(i) => {
+                let abs_open = start + "<tool_call>".len();
+                let abs_end = abs_open + i;
+                let close_len = if i >= "<tool_call>".len() {
+                    let tag = "</tool_call>";
+                    if abs_end >= tag.len() && cursor.get(abs_end - tag.len()..abs_end) == Some(tag) {
+                        0
+                    } else {
+                        tag.len()
+                    }
+                } else {
+                    0
+                };
+                if abs_end + close_len <= cursor.len() {
+                    &cursor[abs_end + close_len..]
+                } else {
+                    ""
+                }
+            }
+            None => "",
+        };
+    }
+    // 3. If no <tool_call> tags but has {...} block(s), try to extract
+    if steps.is_empty() {
+        let mut i = 0;
+        let bytes = raw.as_bytes();
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                let mut depth = 0i32;
+                let mut end = i;
+                for (j, &b) in bytes[i..].iter().enumerate() {
+                    if b == b'{' { depth += 1; }
+                    else if b == b'}' {
+                        depth -= 1;
+                        if depth == 0 { end = i + j + 1; break; }
+                    }
+                }
+                if end > i {
+                    if let Ok(v) = serde_json::from_str::<Value>(&raw[i..end]) {
+                        if v.get("action").is_some() && (v.get("text").is_some() || v.get("steps").is_some()) {
+                            return v;
+                        }
+                        if v.get("action").is_some() && v.get("args").is_some() {
+                            steps.push(v);
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    // 4. Build canonical tool-plan JSON if we found steps
+    if !steps.is_empty() {
+        return json!({
+            "thinking": "",
+            "prediction": "",
+            "feeling": "",
+            "action": "tool",
+            "steps": steps,
+        });
+    }
+    // 5. No tool_call, no JSON — treat entire raw as reply text
+    let cleaned = raw
+        .replace("<tool_call>", "")
+        .replace("</tool_call>", "")
+        .trim()
+        .to_string();
+    if !cleaned.is_empty() {
+        json!({
+            "thinking": "",
+            "prediction": "",
+            "feeling": "",
+            "action": "reply",
+            "text": cleaned,
+        })
+    } else {
+        json!({})
+    }
+}
+
+// ═══ LLM Call with Fallback (preserved) ═════════════════════════════════════
 
 /// Try tier-matched provider (if any), then primary, then each fallback in order.
 /// Writes a decision record to `state_dir/router_decisions.jsonl` if state_dir set.
@@ -1004,7 +989,6 @@ async fn call_llm_with_fallback(
 ) -> Option<String> {
     use crate::model_router::{classify_task, log_decision, iso_now, RouterDecision, estimate_cost_usd};
 
-    // Compute total prompt char count for both classification and logging.
     let prompt_chars: usize = messages
         .iter()
         .map(|m| m.get("content").and_then(|v| v.as_str()).map(str::len).unwrap_or(0))
@@ -1012,8 +996,7 @@ async fn call_llm_with_fallback(
     let tier = classify_task(role_hint, prompt_chars);
     let start = std::time::Instant::now();
 
-    // Time-grounding: inject current time as a system-tier hint if not already present.
-    // 曦 also编时间, this fixes both.
+    // Time grounding
     let now_iso = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %A").to_string();
     let time_msg = json!({
         "role": "system",
@@ -1046,8 +1029,7 @@ async fn call_llm_with_fallback(
         } else {
             eprintln!(
                 "[LLM] tier '{}' provider {} failed, falling back",
-                tier.as_str(),
-                tp.provider.label
+                tier.as_str(), tp.provider.label
             );
             tried_fallback = true;
         }
@@ -1093,7 +1075,7 @@ async fn call_llm_with_fallback(
         }
     }
 
-    // 4) Log the decision (best-effort; skip if state_dir is empty)
+    // 4) Log the decision
     if !config.state_dir.is_empty() {
         let duration_ms = start.elapsed().as_millis();
         let reply_chars = reply.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -1101,15 +1083,16 @@ async fn call_llm_with_fallback(
         let cost_estimate_usd = estimate_cost_usd(tier, prompt_chars, reply_chars);
         let decision = RouterDecision {
             ts: iso_now(),
-            role_hint,
-            tier: tier.as_str(),
-            picked_model: &picked_model,
-            picked_label: &picked_label,
+            role_hint: role_hint.to_string(),
+            tier,
+            picked_model: picked_model.clone(),
+            picked_label: picked_label.clone(),
             prompt_chars,
-            duration_ms,
+            duration_ms: duration_ms.try_into().unwrap_or(0),
             success,
             reply_chars,
             tried_fallback,
+            reason: format!("tier={}", tier.as_str()),
             cost_estimate_usd,
         };
         log_decision(&config.state_dir, &decision);
@@ -1118,6 +1101,7 @@ async fn call_llm_with_fallback(
     reply
 }
 
+/// Low-level LLM call (text-only, no tools). Used by `call_llm_with_fallback`.
 async fn call_llm(
     http_client: &reqwest::Client,
     llm_base: &str,
@@ -1146,10 +1130,6 @@ async fn call_llm(
     }
     let json: Value = serde_json::from_str(&text).ok()?;
     let msg = &json["choices"][0]["message"];
-    // ── Multi-provider content extraction (2026-07-09) ──
-    // M3: content (separate from reasoning_content)
-    // SenseNova: reasoning (no content if reasoning ate all tokens) + content
-    // Agnes: content only
     let content = msg["content"].as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -1158,33 +1138,30 @@ async fn call_llm(
     Some(content)
 }
 
-// === TaskOutcome - 2026-07-28 shijieru ===
-// "㱨"ֻͣ"˵Ҫ"һ
-// д̣state/mother/task_outcomes.jsonl (append-only)
+// ═══ TaskOutcome ═════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum TaskStatus {
-    Done,        // 
-    Partial,     // һ
-    Blocked,     // ס/Դ
-    Failed,      // ʧ
+    Done,
+    Partial,
+    Blocked,
+    Failed,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskOutcome {
     pub task_id: String,
     pub status: TaskStatus,
-    pub summary: String,            // һ仰ۣ<=200
+    pub summary: String,
     pub tool_calls: usize,
     pub plan_steps: usize,
-    pub artifacts: Vec<String>,     // ļ·
-    pub next_step: Option<String>,  // һҪʲô
+    pub artifacts: Vec<String>,
+    pub next_step: Option<String>,
     pub ts: String,
-    pub source: String,             // "wechat" / "matrix"
+    pub source: String,
 }
 
 impl TaskOutcome {
-    ///  AgentResult Զж status +  summary
     pub fn from_agent(
         task_id: &str,
         agent_result: &AgentResult,
@@ -1194,12 +1171,11 @@ impl TaskOutcome {
         let status = if !agent_result.success {
             TaskStatus::Failed
         } else if agent_result.tool_calls == 0 && agent_result.plan_steps == 0 {
-            TaskStatus::Partial  // 죬ûɻ
+            TaskStatus::Partial
         } else {
             TaskStatus::Done
         };
 
-        // summary  reply ǰ 100 ȡض
         let reply_chars: String = agent_result.reply.chars().take(100).collect();
         let summary = if reply_chars.is_empty() {
             format!("[no reply] user asked: {}", user_msg.chars().take(60).collect::<String>())
@@ -1221,9 +1197,9 @@ impl TaskOutcome {
     }
 }
 
-/// д TaskOutcome  state/mother/task_outcomes.jsonl
+/// Write TaskOutcome to state/mother/task_outcomes.jsonl
 pub fn write_task_outcome(outcome: &TaskOutcome) {
-    let path = std::path::PathBuf::from(crate::HOME)
+    let path = std::path::PathBuf::from(crate::HOME.as_str())
         .join("state")
         .join("mother")
         .join("task_outcomes.jsonl");
