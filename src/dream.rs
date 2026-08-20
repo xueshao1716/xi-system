@@ -7,7 +7,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-const HOME: &str = "/mnt/d/xi-system";
 
 // __ ___ __
 const MIN_WORKING_FOR_LIGHT: usize = 3;
@@ -225,7 +224,7 @@ fn dream_cycle(working: Vec<String>, episodic: Vec<String>) -> Vec<DreamEntry> {
 
     // ____?
     if !results.is_empty() {
-        let path = format!("{}/dreams.json", HOME);
+        let path = format!("{}/dreams.json", crate::xi_home());
         let mut existing: Vec<DreamEntry> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -244,7 +243,7 @@ fn dream_cycle(working: Vec<String>, episodic: Vec<String>) -> Vec<DreamEntry> {
 
         // _?L2 fact
         for d in &results {
-            let fact_path = format!("{}/memory/l2_facts/{}.md", HOME, d.l2_key);
+            let fact_path = format!("{}/memory/l2_facts/{}.md", crate::xi_home(), d.l2_key);
             let content = format!(
                 "# dream: {}{}",
 
@@ -260,7 +259,7 @@ fn dream_cycle(working: Vec<String>, episodic: Vec<String>) -> Vec<DreamEntry> {
 
 // __ _________?dream_summary _____
 pub fn dream_summary() -> String {
-    let path = format!("{}/dreams.json", HOME);
+    let path = format!("{}/dreams.json", crate::xi_home());
     let dreams: Vec<DreamEntry> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())

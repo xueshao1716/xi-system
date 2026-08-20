@@ -13,7 +13,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const ORGANS_STATE_DIR: &str = "/mnt/d/xi-system/state/organs";
 
 pub const ORGAN_GENES: [(&str, f64, f64, &str); 8] = [
     ("personal_engram", 0.62, 0.06,
@@ -179,7 +178,7 @@ impl OrganSystem {
     }
 
     pub fn state_path(&self) -> String {
-        format!("{}/organs.json", ORGANS_STATE_DIR)
+        format!("{}/state/organs/organs.json", crate::xi_home())
     }
 
     pub fn save(&self) {
@@ -189,7 +188,7 @@ impl OrganSystem {
             eprintln!("[organs] State too large ({:.1}MB), skipping save", size_mb);
             return;
         }
-        let _ = std::fs::create_dir_all(ORGANS_STATE_DIR);
+        let _ = std::fs::create_dir_all(format!("{}/state/organs", crate::xi_home()));
         let _ = std::fs::write(self.state_path(), json);
     }
 

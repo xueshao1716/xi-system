@@ -11,8 +11,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const HOME: &str = "/mnt/d/xi-system";
-const STATE_DIR: &str = "/mnt/d/xi-system/state/brain";
 
 const REGION_NAMES: [&str; 8] = [
     "analysis", "planning", "verification",
@@ -59,7 +57,7 @@ impl NeuralCore {
     }
 
     pub fn load(&mut self) -> bool {
-        let p = format!("{}/neural_core.json", HOME);
+        let p = format!("{}/neural_core.json", crate::xi_home());
         if let Ok(content) = std::fs::read_to_string(&p) {
             if let Ok(loaded) = serde_json::from_str::<NeuralCore>(&content) {
                 *self = loaded;
@@ -70,7 +68,7 @@ impl NeuralCore {
     }
 
     pub fn save(&self) {
-        let p = format!("{}/neural_core.json", HOME);
+        let p = format!("{}/neural_core.json", crate::xi_home());
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(p, json);
         }

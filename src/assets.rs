@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HOME: &str = "/mnt/d/xi-system";
 
 const POOL_TYPES: &[&str] = &["gene", "command", "protocol", "role_profile"];
 const CANDIDATE_MAX: f64 = 0.4;
@@ -45,7 +44,7 @@ fn now_iso() -> String {
 }
 
 fn load() -> HashMap<String, Vec<Asset>> {
-    let p = format!("{}/assets.json", HOME);
+    let p = format!("{}/assets.json", crate::xi_home());
     std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -53,7 +52,7 @@ fn load() -> HashMap<String, Vec<Asset>> {
 }
 
 fn save(data: &HashMap<String, Vec<Asset>>) {
-    let p = format!("{}/assets.json", HOME);
+    let p = format!("{}/assets.json", crate::xi_home());
     if let Ok(json) = serde_json::to_string_pretty(data) {
         let _ = std::fs::write(&p, json);
     }

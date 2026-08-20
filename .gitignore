@@ -1,0 +1,37 @@
+# ── Rust ──
+/target/
+Cargo.lock.orig
+
+# ── Python/WSL 环境（误跟踪清理）──
+/.venv/
+/.local-lib/
+
+# ── 运行数据（含 API key/token，禁止进仓库）──
+/config.json
+/brain.json
+/history.json
+/emotion.json
+/emotion_history.jsonl
+/growth.json
+/ctx2skill.json
+/proactive.json
+/relationship.json
+/working_memory.json
+/mother.json
+/neural_core.json
+/core_state.json
+/migration_*.json
+*.jsonl
+
+# ── 状态/记忆/日志（运行数据）──
+/state/
+/memory/
+/chat/
+/backups/
+/archived/
+*.log
+xi_windows.log
+
+# ── 运行产物 ──
+/build.sh.bak
+*.bak*

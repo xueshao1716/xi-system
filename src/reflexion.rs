@@ -5,7 +5,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
-const STATE_PATH: &str = "/mnt/d/xi-system/state/reflexion.json";
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ActionRecord {
@@ -62,7 +61,7 @@ impl ReflexionLoop {
     }
 
     pub fn load() -> Self {
-        let content = match std::fs::read_to_string(STATE_PATH) {
+        let content = match std::fs::read_to_string(format!("{}/state/reflexion.json", crate::xi_home())) {
             Ok(c) => c,
             Err(_) => return Self::new(),
         };
@@ -71,8 +70,8 @@ impl ReflexionLoop {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self) {
-            let _ = std::fs::create_dir_all("/mnt/d/xi-system/state");
-            let _ = std::fs::write(STATE_PATH, json);
+            let _ = std::fs::create_dir_all(format!("{}/state", crate::xi_home()));
+            let _ = std::fs::write(format!("{}/state/reflexion.json", crate::xi_home()), json);
         }
     }
 

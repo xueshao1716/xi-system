@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const TOKEN_PATH: &str = "/mnt/d/xi-system/matrix_token.json";
 
 /// Matrix client for XI system
 pub struct MatrixClient {
@@ -177,7 +176,7 @@ impl MatrixClient {
     }
 
     fn load_token() -> Option<TokenCache> {
-        std::fs::read_to_string(TOKEN_PATH).ok()
+        std::fs::read_to_string(format!("{}/matrix_token.json", crate::xi_home())).ok()
             .and_then(|s| serde_json::from_str::<TokenCache>(&s).ok())
     }
 
@@ -188,7 +187,7 @@ impl MatrixClient {
             saved_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&cache) {
-            let _ = std::fs::write(TOKEN_PATH, &json);
+            let _ = std::fs::write(format!("{}/matrix_token.json", crate::xi_home()), &json);
         }
     }
 
@@ -241,7 +240,7 @@ impl MatrixClient {
             if status.as_u16() == 401 {
                 self.ready = false;
                 self.access_token = None;
-                let _ = std::fs::remove_file(TOKEN_PATH);
+                let _ = std::fs::remove_file(format!("{}/matrix_token.json", crate::xi_home()));
                 return Err("token expired, re-login needed".to_string());
             }
             return Err(format!("Sync failed (HTTP {}): {}", status, text.chars().take(100).collect::<String>()));
