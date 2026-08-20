@@ -26,6 +26,7 @@ mod broker;
 mod repair;
 mod agent_loop;
 mod tool_forge;
+mod risk_guard;
 mod relationship;
 mod working_memory;
 mod mother;

@@ -227,6 +227,12 @@ async fn cmd_exec(args: &serde_json::Value) -> String {
     if cmd.is_empty() {
         return "Error: empty command".to_string();
     }
+    // 2026-08-21 护栏接入：risk_guard 危险命令拦截（rm -rf / 等 BLOCK_OR_CONFIRM）
+    let verdict = crate::risk_guard::check_command(cmd);
+    if verdict.dangerous {
+        return format!("❌ [risk_guard] 危险命令被拦截（{}）: {}。{}",
+            verdict.level, verdict.reasons.join(" / "), verdict.suggestion);
+    }
 
     // Windows 原生环境适配：曦旧习惯里的 WSL 路径和 wsl 调用自动转换
     #[cfg(windows)]
