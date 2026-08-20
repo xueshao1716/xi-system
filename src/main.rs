@@ -30,6 +30,7 @@ mod risk_guard;
 mod anti_homogenization;
 mod daily_judgment;
 mod correction;
+mod improvement_proposal;
 mod relationship;
 mod working_memory;
 mod mother;
@@ -556,6 +557,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match dj.judge(&summary, "低风险（状态摘要自动生成）") {
                     Ok(r) => println!("[daily-judgment] 已记录: {}", r.judgment),
                     Err(e) => eprintln!("[daily-judgment] {}", e),
+                }
+            }
+            // 2026-08-21 自我改进提案：一天工作数据 → 分析优缺点 → 主动提案改进
+            let analyzer = crate::improvement_proposal::ImprovementAnalyzer::new(home());
+            let recent: Vec<&crate::reflexion::ActionRecord> = reflexion.recent_actions(300);
+            let mut props = analyzer.analyze(&recent);
+            let lessons_path = format!("{}/state/mother/real_lessons.jsonl", home());
+            props.extend(analyzer.analyze_lessons(&lessons_path));
+            let open_before = analyzer.open_proposals().len();
+            if let Err(e) = analyzer.save(&props) {
+                eprintln!("[improvement] 保存失败: {}", e);
+            }
+            let open_after = analyzer.open_proposals().len();
+            if open_after > open_before {
+                println!("[improvement] 📋 自我改进提案 +{}（当前 {} 条 open）", open_after - open_before, open_after);
+                for p in &props {
+                    if p.status == "open" {
+                        println!("  [{}] {} | {}", match p.kind {
+                            crate::improvement_proposal::ProposalKind::Strength => "优点",
+                            crate::improvement_proposal::ProposalKind::Weakness => "缺点",
+                            crate::improvement_proposal::ProposalKind::Efficiency => "效率",
+                            crate::improvement_proposal::ProposalKind::Safety => "安全",
+                        }, p.title, p.suggestion);
+                    }
                 }
             }
         }
