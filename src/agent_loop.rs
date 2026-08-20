@@ -382,6 +382,58 @@ pub enum LlmResponse {
 
 // ═══ Agent Loop — Tool Loop Edition ══════════════════════════════════════════
 
+
+// ═══ Triage Gate（cumora small-brain 借鉴，2026-08-20）═══
+// 大模型之前先小模型分流：闲聊/简单问答直接小模型答，不进工具循环（省时省钱）；
+// 复杂任务才走工具循环。triage 失败/超时 → 退回 RequestType 分类。
+
+#[derive(Debug, Clone)]
+pub struct TriageDecision {
+    pub complexity: String, // low / medium / high
+    pub needs_tools: bool,
+    pub reason: String,
+}
+
+impl TriageDecision {
+    fn unknown() -> Self {
+        TriageDecision { complexity: "medium".into(), needs_tools: true, reason: "triage 失败，按 medium 处理".into() }
+    }
+    fn parse(text: &str) -> TriageDecision {
+        // 提取第一个 { ... } JSON
+        if let Some(start) = text.find('{') {
+            if let Some(end) = text[start..].find('}') {
+                let json_str = &text[start..start + end + 1];
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let complexity = v["complexity"].as_str().unwrap_or("medium").to_string();
+                    let needs_tools = v["needs_tools"].as_bool().unwrap_or(true);
+                    let reason = v["reason"].as_str().unwrap_or("").to_string();
+                    return TriageDecision { complexity, needs_tools, reason };
+                }
+            }
+        }
+        TriageDecision::unknown()
+    }
+}
+
+/// 小模型分流：判断请求复杂度 + 是否需要工具
+async fn triage_request(
+    http_client: &reqwest::Client,
+    config: &AgentConfig,
+) -> TriageDecision {
+    let prompt = format!(
+        "你是任务分流器。判断下面用户请求的复杂度和是否需要工具，只输出 JSON（不要多余文字）：
+         {{\"complexity\": \"low\"|\"medium\"|\"high\", \"needs_tools\": true|false, \"reason\": \"一句话原因\"}}
+         low=闲聊/简单问答/不需要查资料；medium=需要查一点东西或简单操作；high=复杂任务/多步骤/文件或代码操作。
+         用户请求：{}",
+        config.user_message.chars().take(200).collect::<String>()
+    );
+    let msgs = vec![json!({"role": "user", "content": prompt})];
+    match call_llm(http_client, &config.llm_base, &config.api_key, &config.model, &msgs).await {
+        Some(text) => TriageDecision::parse(&text),
+        None => TriageDecision::unknown(),
+    }
+}
+
 pub async fn agent_loop_enhanced(
     config: &AgentConfig,
     repair_engine: &crate::repair::RepairEngine,
@@ -399,6 +451,27 @@ pub async fn agent_loop_enhanced(
     let request_type = RequestType::classify(&config.user_message, emotion.valence);
     let reply_style = request_type.reply_style();
     println!("[Agent] Request type: {:?}, style: {}", request_type, reply_style);
+
+    // ═══ Phase 0.5: Triage Gate（小模型分流）═══
+    // 闲聊/简单问答 → 直接回复不进工具循环；复杂才走工具循环
+    let triage = triage_request(http_client, config).await;
+    println!("[Agent] triage: complexity={} tools={} reason={}", triage.complexity, triage.needs_tools, triage.reason.chars().take(60).collect::<String>());
+    if triage.complexity == "low" && !triage.needs_tools {
+        println!("[Agent] 快速路径：简单请求直接回复（跳过工具循环）");
+        let simple_msgs = vec![
+            json!({"role": "system", "content": &config.system_prompt}),
+            json!({"role": "user", "content": &config.user_message}),
+        ];
+        let reply = call_llm(http_client, &config.llm_base, &config.api_key, &config.model, &simple_msgs).await
+            .unwrap_or_else(|| "（抱歉，我暂时没想好怎么回答）".to_string());
+        // 灵魂自检（简单回复也查偏）
+        let check = crate::soul::check_persona(&reply);
+        if !check.passed {
+            eprintln!("[soul] {}", check.report());
+        }
+        let success = !reply.is_empty();
+        return AgentResult { reply, tool_calls: 0, plan_steps: 1, success };
+    }
 
     // ═══ Phase 1: Build Initial Messages ═══
     let emotion_ctx = emotion.emotional_context();

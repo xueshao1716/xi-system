@@ -139,18 +139,8 @@ fn build_static_prompt(brain: &soul::Brain, soul_md: &str) -> String {
         "no growth data",
         &std::collections::HashMap::new(),
     );
-    // Append live tool capabilities from tools::tool_definitions()
-    let mut tool_section = String::from("\n\nLive Tool Capabilities (auto-generated 2026-07-07):\n");
-    for tool_def in tools::tool_definitions() {
-        let name = tool_def["function"]["name"].as_str().unwrap_or("?");
-        let desc = tool_def["function"]["description"].as_str().unwrap_or("");
-        let desc_short = if desc.chars().count() > 80 {
-            format!("{}…", desc.chars().take(80).collect::<String>())
-        } else {
-            desc.to_string()
-        };
-    tool_section.push_str(&format!("- {}: {}\n", name, desc_short));
-    }
+    // 2026-08-20 反模式自查（cumora COORDINATION 借鉴）：不再把全量工具目录塞 system prompt——
+    // function calling 的 tool schema 已携带工具信息，重复列目录只是模型要跳过的冗余字节。工具按需调用。
 
     // System map — facts about the system (not directives)
     let system_map = "
@@ -213,7 +203,7 @@ System Map (facts 2026-08-02):
             year, month, day, weekday, hour, minute
         )
     };
-    format!("{}{}{}{}", base, tool_section, system_map, time_str)
+    format!("{}{}{}", base, system_map, time_str)
 }
 
 fn build_context(
