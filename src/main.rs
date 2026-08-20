@@ -28,6 +28,7 @@ mod agent_loop;
 mod tool_forge;
 mod risk_guard;
 mod anti_homogenization;
+mod daily_judgment;
 mod relationship;
 mod working_memory;
 mod mother;
@@ -540,6 +541,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !flags.is_empty() {
                 let desc: Vec<String> = flags.iter().map(|(t, p)| format!("{} {:.0}%", t, p)).collect();
                 eprintln!("[anti-homogenization] ⚠️ 同质化警告: {}（该换方向了）", desc.join(", "));
+            }
+        }
+        // 2026-08-21 每日判断（aibody daily_judgment 移植）：每天产一条自己的判断
+        if tick_now % 300 == 0 {
+            let dj = crate::daily_judgment::DailyJudgmentStore::new(home());
+            if !dj.has_judgment_today() {
+                let summary = format!(
+                    "今天 {:.0} 代进化、{} 条反思、{} 条关系记忆——继续进化，该拆的拆该合的合",
+                    mother_layer.generation(), reflexion.reflections.len(),
+                    relationship_book.relationships.len()
+                );
+                match dj.judge(&summary, "低风险（状态摘要自动生成）") {
+                    Ok(r) => println!("[daily-judgment] 已记录: {}", r.judgment),
+                    Err(e) => eprintln!("[daily-judgment] {}", e),
+                }
             }
         }
         // 2026-08-02 修复：定期向 aibody 层上报心跳（此前 bump_heartbeat 从未被调用，aibody 永远 inactive）

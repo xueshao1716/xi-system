@@ -17,6 +17,7 @@ pub mod organs;
 pub mod proactive;
 pub mod risk_guard;
 pub mod anti_homogenization;
+pub mod daily_judgment;
 pub mod upgrade_guard;
 pub mod relationship;
 pub mod working_memory;
