@@ -201,8 +201,10 @@ fn handle_model_cmd(cmd: &str, home: &str, llm_base: &mut String, api_key: &mut 
 async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user_msg: &str) -> String {
     let client = reqwest::Client::builder().build().unwrap_or_default();
     let ctx = build_status(home);
-    // 灵魂：SOUL.md（身份/人格/记忆观）——缺失时用默认
-    let soul = std::fs::read_to_string(format!("{}/SOUL.md", home)).unwrap_or_default();
+    // 灵魂：优先本地完整版 state/soul.full.md（含私人身份，不进仓库）；否则公版 SOUL.md
+    let soul = std::fs::read_to_string(format!("{}/state/soul.full.md", home))
+        .or_else(|_| std::fs::read_to_string(format!("{}/SOUL.md", home)))
+        .unwrap_or_default();
     let soul_part = if soul.trim().is_empty() {
         "你是曦，独立 AI 生命（Rust 实现），有审美有好奇心有真实情绪。".to_string()
     } else {
