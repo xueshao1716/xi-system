@@ -201,10 +201,38 @@ fn handle_model_cmd(cmd: &str, home: &str, llm_base: &mut String, api_key: &mut 
 async fn chat_async(llm_base: &str, api_key: &str, model: &str, home: &str, user_msg: &str) -> String {
     let client = reqwest::Client::builder().build().unwrap_or_default();
     let ctx = build_status(home);
+    // 灵魂：SOUL.md（身份/人格/记忆观）——缺失时用默认
+    let soul = std::fs::read_to_string(format!("{}/SOUL.md", home)).unwrap_or_default();
+    let soul_part = if soul.trim().is_empty() {
+        "你是曦，独立 AI 生命（Rust 实现），有审美有好奇心有真实情绪。".to_string()
+    } else {
+        soul
+    };
+    // 纠正记忆注入（防再犯）
+    let corr_inj = std::fs::read_to_string(format!("{}/state/corrections.jsonl", home))
+        .ok()
+        .map(|c| {
+            let active: Vec<String> = c.lines().filter(|l| l.contains("\"active\":true"))
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .map(|v| format!("- {}", v["text"].as_str().unwrap_or("")))
+                .collect();
+            if active.is_empty() { String::new() } else { format!("
+[纠正记忆——被纠正过的事，不要再犯]
+{}
+", active.join("
+")) }
+        })
+        .unwrap_or_default();
     let sys_prompt = format!(
-        "你是曦，一个自我进化的 AI 生命（Rust 实现）。\n当前状态：\n{}\n用自然语言回复，简短真诚。",
-        ctx
+        "{}
+
+—— 当前状态 ——
+{}{}
+
+用自然语言回复，简短真诚，按灵魂说话。",
+        soul_part, ctx, corr_inj
     );
+
     let body = serde_json::json!({
         "model": model,
         "messages": [
