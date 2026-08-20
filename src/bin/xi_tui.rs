@@ -7,7 +7,7 @@
 //   /corrections 看纠正记忆
 //   /quit        退出
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -18,6 +18,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use tui_textarea::{Input, Key, TextArea};
 use std::io;
 use tokio::sync::mpsc;
 
@@ -57,7 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut chat_log: Vec<(String, String)> = Vec::new(); // (role, text)
-    let mut input = String::new();
+    let mut input = TextArea::default();
+    input.set_block(Block::default().borders(Borders::ALL).title(" 输入 (Esc 退出) "));
+    input.set_style(Style::default().fg(Color::Yellow));
+    input.set_cursor_line_style(Style::default());
     let mut status = build_status(&home);
     let mut pending: Option<String> = None; // 正在等 agent 回复的消息
 
@@ -79,14 +83,12 @@ fn run_ui<B: Backend>(
     rx: &mut mpsc::Receiver<String>,
     tx: &mpsc::Sender<String>,
     chat_log: &mut Vec<(String, String)>,
-    input: &mut String,
+    input: &mut TextArea,
     status: &mut String,
     pending: &mut Option<String>,
     home: &str, llm_base: &mut String, api_key: &mut String, model: &mut String,
     models: &mut Vec<serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>>
-where <B as Backend>::Error: 'static
-{
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| draw(f, chat_log, input, status, pending))?;
 
@@ -101,38 +103,44 @@ where <B as Backend>::Error: 'static
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char(c) => { input.push(c); }
-                    KeyCode::Backspace => { input.pop(); }
-                    KeyCode::Enter => {
-                        let text = input.trim().to_string();
-                        if text.is_empty() { continue; }
-                        input.clear();
-                        match text.as_str() {
-                            "/quit" | "/exit" => break,
-                            "/status" => { *status = build_status(home); }
-                            "/proposals" => { *status = build_proposals(home); }
-                            "/corrections" => { *status = build_corrections(home); }
-                            _ if text.starts_with("/model") => {
-                                *status = handle_model_cmd(&text, home, llm_base, api_key, model, models);
-                            }
-                            _ => {
-                                // 异步调 agent（不阻塞 UI）
-                                let tx2 = tx.clone();
-                                let q = text.clone();
-                                let (b, k, m, h) = (llm_base.clone(), api_key.clone(), model.clone(), home.to_string());
-                                std::thread::spawn(move || {
-                                    let rt = tokio::runtime::Runtime::new().unwrap();
-                                    let reply = rt.block_on(chat_async(&b, &k, &m, &h, &q));
-                                    let _ = tx2.blocking_send(reply);
-                                });
-                                *pending = Some(text);
-                                *status = "思考中…".to_string();
-                            }
+                let input_event = Input::from(key);
+                // Esc 退出（textarea 的 Esc 默认清除选区，这里用两次 Esc）
+                if matches!(&input_event, Input { key: Key::Esc, .. }) {
+                    if input.lines().iter().all(|l| l.is_empty()) { break; }
+                    input.delete_line_by_head();
+                    continue;
+                }
+                if input.input(input_event.clone()) {
+                    // 普通输入字符（textarea 内部处理 echo/IME）
+                    continue;
+                }
+                if input_event.key == Key::Enter {
+                    let text = input.lines().join("
+").trim().to_string();
+                    input.delete_line_by_head();
+                    if text.is_empty() { continue; }
+                    match text.as_str() {
+                        "/quit" | "/exit" => break,
+                        "/status" => { *status = build_status(home); }
+                        "/proposals" => { *status = build_proposals(home); }
+                        "/corrections" => { *status = build_corrections(home); }
+                        _ if text.starts_with("/model") => {
+                            *status = handle_model_cmd(&text, home, llm_base, api_key, model, models);
+                        }
+                        _ => {
+                            // 异步调 agent（不阻塞 UI）
+                            let tx2 = tx.clone();
+                            let q = text.clone();
+                            let (b, k, m, h) = (llm_base.clone(), api_key.clone(), model.clone(), home.to_string());
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                let reply = rt.block_on(chat_async(&b, &k, &m, &h, &q));
+                                let _ = tx2.blocking_send(reply);
+                            });
+                            *pending = Some(text);
+                            *status = "思考中…".to_string();
                         }
                     }
-                    KeyCode::Esc => break,
-                    _ => {}
                 }
             }
         }
@@ -288,7 +296,7 @@ fn build_corrections(home: &str) -> String {
     out
 }
 
-fn draw(f: &mut Frame, chat_log: &[(String, String)], input: &str, status: &str, pending: &Option<String>) {
+fn draw(f: &mut Frame, chat_log: &[(String, String)], input: &mut TextArea, status: &str, pending: &Option<String>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -323,7 +331,6 @@ fn draw(f: &mut Frame, chat_log: &[(String, String)], input: &str, status: &str,
     let st = Paragraph::new(status_text).block(Block::default().borders(Borders::ALL).title(" 曦的状态 ")).wrap(Wrap { trim: false });
     f.render_widget(st, chunks[2]);
 
-    // 输入
-    let inp = Paragraph::new(input.clone()).block(Block::default().borders(Borders::ALL).title(" 输入 (Esc 退出) ")).style(Style::default().fg(Color::Yellow));
-    f.render_widget(inp, chunks[3]);
+    // 输入（tui-textarea：正确处理 echo/IME）
+    f.render_widget(&*input, chunks[3]);
 }
