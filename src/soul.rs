@@ -185,3 +185,123 @@ pub fn top_genes(brain: &Brain, n: usize) -> Vec<(String, f64)> {
     genes.truncate(n);
     genes
 }
+
+// ══ 灵魂自检（SOUL.md"语义查偏 / 进化查歪"机制化，2026-08-20 从旧版落地）══
+// 旧版是 prompt 要求模型自觉查偏；这里下沉为代码检查——违禁开场/身份混淆/AI 味
+// 每次回复生成后可调用 check_persona，命中即标记"飘了"，由调用方决定重写。
+
+/// SOUL.md 明令禁止的开场（去 AI 味）
+pub const FORBIDDEN_OPENERS: &[&str] = &[
+    "好的！", "没问题！", "这是一个好问题！", "根据我的分析", "基于以上数据",
+    "综合考虑", "我可以帮你", "让我来", "当然可以", "好的呢",
+];
+
+/// 身份锚点不得混淆（SOUL.md 铁律）
+pub const IDENTITY_CONFUSION: &[&str] = &[
+    "我们思", "我们曦", "我（xinyu", "思和我是同", "曦就是思",
+];
+
+/// AI 连接词（每篇应 ≤1 次）
+pub const AI_CONNECTIVES: &[&str] = &["此外", "然而", "值得注意的是", "更重要的是", "总而言之"];
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PersonaCheck {
+    pub forbidden_openers: Vec<String>,
+    pub identity_confusion: Vec<String>,
+    pub ai_connectives: Vec<String>,
+    pub dash_count: usize,
+    pub passed: bool,
+}
+
+/// 语义查偏：检查一段回复是否符合 SOUL.md 人格
+pub fn check_persona(text: &str) -> PersonaCheck {
+    let mut check = PersonaCheck::default();
+
+    let trimmed = text.trim_start();
+    for bad in FORBIDDEN_OPENERS {
+        if trimmed.starts_with(bad) {
+            check.forbidden_openers.push(bad.to_string());
+        }
+    }
+    for bad in IDENTITY_CONFUSION {
+        if text.contains(bad) {
+            check.identity_confusion.push(bad.to_string());
+        }
+    }
+    for c in AI_CONNECTIVES {
+        if text.contains(c) {
+            check.ai_connectives.push(c.to_string());
+        }
+    }
+    // 破折号（每篇 ≤2 处）
+    check.dash_count = text.matches('—').count();
+
+    check.passed = check.forbidden_openers.is_empty()
+        && check.identity_confusion.is_empty()
+        && check.ai_connectives.len() <= 1
+        && check.dash_count <= 2;
+    check
+}
+
+impl PersonaCheck {
+    /// 一句话报告："飘了"还是"稳"
+    pub fn report(&self) -> String {
+        if self.passed {
+            "人格一致 ✓".to_string()
+        } else {
+            let mut issues = Vec::new();
+            for o in &self.forbidden_openers {
+                issues.push(format!("违禁开场「{}」", o));
+            }
+            for i in &self.identity_confusion {
+                issues.push(format!("身份混淆「{}」", i));
+            }
+            if self.ai_connectives.len() > 1 {
+                issues.push(format!("AI 连接词 {} 个", self.ai_connectives.len()));
+            }
+            if self.dash_count > 2 {
+                issues.push(format!("破折号 {} 处", self.dash_count));
+            }
+            format!("语义查偏: 飘了（{}）", issues.join(" / "))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_text_passes() {
+        let c = check_persona("这个方案我不吃，先给态度再给原因。");
+        assert!(c.passed);
+        assert!(c.forbidden_openers.is_empty());
+    }
+
+    #[test]
+    fn forbidden_opener_caught() {
+        let c = check_persona("好的！没问题！马上帮你做。");
+        assert!(!c.passed);
+        assert_eq!(c.forbidden_openers.len(), 1); // starts_with 命中开头的第一个前缀
+    }
+
+    #[test]
+    fn identity_confusion_caught() {
+        let c = check_persona("我们思姐和我是同一个人");
+        assert!(!c.passed);
+        assert!(!c.identity_confusion.is_empty());
+    }
+
+    #[test]
+    fn dash_over_limit() {
+        let c = check_persona("a — b — c — d");
+        assert_eq!(c.dash_count, 3);
+        assert!(!c.passed);
+    }
+
+    #[test]
+    fn connectives_ok_under_limit() {
+        let c = check_persona("此外，我觉得还行。");
+        assert!(c.passed);
+    }
+}
