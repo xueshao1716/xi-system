@@ -110,14 +110,11 @@ fn run_ui<B: Backend>(
                     input.delete_line_by_head();
                     continue;
                 }
-                if input.input(input_event.clone()) {
-                    // 普通输入字符（textarea 内部处理 echo/IME）
-                    continue;
-                }
+                // 先处理 Enter（发送）——tui-textarea 会把 Enter 当换行吃掉，必须先截胡
                 if input_event.key == Key::Enter {
                     let text = input.lines().join("
 ").trim().to_string();
-                    input.delete_line_by_head();
+                    while input.lines().iter().any(|l| !l.is_empty()) { input.delete_line_by_head(); }
                     if text.is_empty() { continue; }
                     match text.as_str() {
                         "/quit" | "/exit" => break,
