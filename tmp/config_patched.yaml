@@ -1,1 +1,0 @@
-# 读取当前配置，移除 free_response_rooms 中的主房间 ID，移除 require_mention 对主房间的配置

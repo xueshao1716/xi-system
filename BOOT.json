@@ -1,8 +1,0 @@
-{
-  "status": "running",
-  "timestamp": "2026-06-10T00:00:00Z",
-  "core_identity_drift": 0.00,
-  "intent_encoding": "active",
-  "rule_enforced": "normal",
-  "context": "System running. Health check completed. Skills installed: tdd, handoff, caveman, self_harness."
-}

@@ -35,3 +35,44 @@ xi_windows.log
 # ── 运行产物 ──
 /build.sh.bak
 *.bak*
+
+# 运行日志（含 err 后缀）
+*.log*
+
+# 密钥/内部状态
+.agnes_key.b64
+.cargo/
+.system/
+.xi/
+BOOT.json
+.attic/
+
+# 截图/演示图
+*.png
+
+# 对话截图
+chat*/
+
+# 运行状态/工具残留
+config/
+dreams.json
+decrypt-pkg.py
+decrypted-pkg.bin
+find-backup-key.py
+count_breaks.py
+clean-chat.py
+extract-chat.py
+extract-chat2.py
+
+# node 依赖
+node_modules/
+
+# 根目录工具脚本/杂项（保留 scripts/ 目录内）
+/*.py
+/*.ps1
+/*.sh
+/*.bat
+/*.txt
+/*.cfg
+/*.bin
+/*.log*
