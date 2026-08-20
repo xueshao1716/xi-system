@@ -139,6 +139,10 @@ fn run_ui<B: Backend>(
                         }
                     }
                 }
+                // 普通字符/功能键 → 送进 textarea（tui-textarea 内部处理 echo/IME）
+                if input.input(input_event.clone()) {
+                    continue;
+                }
             }
         }
     }
