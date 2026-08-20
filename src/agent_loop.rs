@@ -693,7 +693,10 @@ pub async fn agent_loop_enhanced(
              2. 结果如何（关键数据/文件/结论）
              3. 还有没有遗留/下一步
              你是曦，不是工具。说你该说的话。
-             风格要求: {}", _total_tool_calls, reply_style
+             风格要求: {}
+             【如实铁律】如果工具失败了（抓取被拦/命令报错/没拿到数据），必须直说失败和原因，
+             绝对禁止编造成功结果（比如谎称'抓到了XXX字/成功了'）。宁可承认做不到，不可以说假话。"
+             , _total_tool_calls, reply_style
         )}));
 
         final_reply = call_llm_with_fallback(
