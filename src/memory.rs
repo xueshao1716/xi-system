@@ -338,7 +338,7 @@ impl Memory {
             zone,
             keywords,
             timestamp: Utc::now().to_rfc3339(),
-            supersedes: None,
+            supersedes: supersedes.clone(), // 2026-08-21 修复：新条目应记录它替代谁（原硬编码 None，链断裂）
             superseded_by: None,
             belief_score: belief,
             loaded_count: 0,
@@ -536,5 +536,70 @@ impl Memory {
                     .unwrap_or(false)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_by_content<'a>(mem: &'a Memory, content: &str) -> &'a MemoryEntry {
+        mem.entries.iter().find(|e| e.content == content).expect("条目应存在")
+    }
+
+    #[test]
+    fn zones_priority_order() {
+        assert!(MemoryZone::Core.priority() > MemoryZone::Work.priority());
+        assert!(MemoryZone::Work.priority() > MemoryZone::General.priority());
+        assert!(MemoryZone::General.priority() > MemoryZone::Episode.priority());
+    }
+
+    #[test]
+    fn supersedes_chain_links_entries() {
+        let mut mem = Memory::new();
+        let old_id = "mem-old-1".to_string();
+        mem.entries.push(MemoryEntry {
+            id: old_id.clone(), role: "user".into(), content: "旧方案".into(),
+            zone: MemoryZone::Work, timestamp: Utc::now().to_rfc3339(),
+            supersedes: None, superseded_by: None, loaded_count: 0, referenced_count: 0,
+            keywords: vec![], last_effective_at: None, belief_score: 0.5,
+        });
+        mem.add_with_zone("user", "新方案（替代旧）", MemoryZone::Work, Some(old_id.clone()));
+        let new = find_by_content(&mem, "新方案（替代旧）");
+        assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
+        let old = mem.entries.iter().find(|e| e.id == old_id).unwrap();
+        assert_eq!(old.superseded_by.as_deref(), Some(new.id.as_str()));
+    }
+
+    #[test]
+    fn zone_filtering_returns_only_zone() {
+        let mut mem = Memory::new();
+        mem.add_with_zone("user", "核心工作记忆", MemoryZone::Core, None);
+        mem.add_with_zone("user", "普通对话", MemoryZone::General, None);
+        let core = mem.active_by_zone(MemoryZone::Core);
+        assert_eq!(core.len(), 1);
+        assert_eq!(core[0].content, "核心工作记忆");
+    }
+
+    #[test]
+    fn belief_score_bounded() {
+        let recent = vec!["ai".to_string(), "模型".to_string()];
+        let entry = vec!["ai".to_string(), "进化".to_string()];
+        let s = MemoryEntry::compute_belief(&recent, &entry);
+        assert!((0.0..=1.0).contains(&s), "belief 必须 [0,1]，got {}", s);
+    }
+
+    #[test]
+    fn effectiveness_tracks_loads() {
+        let mut mem = Memory::new();
+        mem.add_with_zone("user", "高频记忆条目测试", MemoryZone::Work, None);
+        let id = find_by_content(&mem, "高频记忆条目测试").id.clone();
+        mem.record_loaded(&id);
+        mem.record_loaded(&id);
+        mem.record_referenced(&id);
+        let stats = mem.effectiveness_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].2, 2, "loaded_count 应为 2");
+        assert_eq!(stats[0].3, 1, "referenced_count 应为 1");
     }
 }
