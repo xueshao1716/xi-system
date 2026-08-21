@@ -110,6 +110,40 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify(lifeState()));
   }
+  // API：事件流（生命脉搏——曦最近在做什么）
+  if (url.pathname === "/api/events") {
+    const evs = readLines(path.join(XI_HOME, "state/mother/pulse_log.jsonl"))
+      .map((l) => { try { const d = JSON.parse(l); return { ts: d.ts || d.timestamp || "", actions: d.actions || [], emotion: d.conversation?.emotion_primary || d.emotion || "", brief: (d.conversation?.reply || d.summary || "").slice(0, 80) }; } catch { return null; } })
+      .filter(Boolean).slice(-20).reverse();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(evs));
+  }
+  // API：基因表达（器官状态）
+  if (url.pathname === "/api/genes") {
+    const g = readJson(path.join(XI_HOME, "state/organs/organs.json"), {});
+    const genes = Object.entries(g.gene_expressions || {}).map(([k, v]) => ({ name: k, value: v })).slice(0, 10);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(genes));
+  }
+  // API：记忆时间线（对话档案 + 学习日志）
+  if (url.pathname === "/api/memory") {
+    const arch = readLines(path.join(XI_HOME, "state/mother/dialogue_archive.jsonl"))
+      .map((l) => { try { const d = JSON.parse(l); return { ts: d.timestamp || "", cat: d.category || "记忆", text: (d.summary || d.content || "").slice(0, 70) }; } catch { return null; } })
+      .filter(Boolean).slice(-12).reverse();
+    const learn = readLines(path.join(XI_HOME, "state/mother/learning_log.jsonl"))
+      .map((l) => { try { const d = JSON.parse(l); return { ts: d.ts || d.timestamp || "", cat: "学习", text: (d.summary || d.content || "").slice(0, 70) }; } catch { return null; } })
+      .filter(Boolean).slice(-6).reverse();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ archive: arch, learning: learn }));
+  }
+  // API：路由决策流
+  if (url.pathname === "/api/routes") {
+    const rs = readLines(path.join(XI_HOME, "state/router_decisions.jsonl"))
+      .map((l) => { try { const d = JSON.parse(l); return { ts: d.ts || "", model: d.picked_model || "", tier: d.tier || "", ms: d.duration_ms || 0, ok: d.success }; } catch { return null; } })
+      .filter(Boolean).slice(-10).reverse();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(rs));
+  }
   // API：对话
   if (url.pathname === "/api/chat" && req.method === "POST") {
     let body = "";
