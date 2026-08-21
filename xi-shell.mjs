@@ -50,7 +50,9 @@ function lifeState() {
 }
 
 // ── 曦的对话（SOUL + 状态 + 记忆注入 → LLM）──
-async function chat(question) {
+const VISION = { model: "deepseek-v4-flash-vision-exp", base_url: "https://api.deepseek.com", api_key: "sk-32d7d33e610740e9b2def662d48202b8" };
+
+async function chat(question, imageB64 = null) {
   const config = readJson(path.join(XI_HOME, "config.json"), {});
   const llm = config.llm || {};
   if (!llm.base_url || !llm.api_key || !llm.model) return "（曦的 LLM 未配置）";
@@ -77,12 +79,16 @@ async function chat(question) {
   ].filter(Boolean).join("\n");
   const base = llm.base_url.replace(/\/+$/, "");
   const url = /\/v1$/.test(base) ? base + "/chat/completions" : base + "/v1/chat/completions";
-  const resp = await fetch(url, {
+  const useVision = !!imageB64;
+  const userContent = useVision
+    ? [{ type: "text", text: question || "看看这张图，说说你看到了什么。" }, { type: "image_url", image_url: { url: "data:image/png;base64," + imageB64 } }]
+    : question;
+  const resp = await fetch(useVision ? "https://api.deepseek.com/chat/completions" : url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.api_key}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${useVision ? VISION.api_key : llm.api_key}` },
     body: JSON.stringify({
-      model: llm.model,
-      messages: [{ role: "system", content: sys }, { role: "user", content: question }],
+      model: useVision ? VISION.model : llm.model,
+      messages: [{ role: "system", content: sys }, { role: "user", content: userContent }],
       stream: false, max_tokens: 2048,
     }),
   });
@@ -149,9 +155,9 @@ const server = http.createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     try {
-      const { message } = JSON.parse(body || "{}");
-      if (!message) { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "缺 message" })); }
-      const reply = await chat(String(message));
+      const { message, image } = JSON.parse(body || "{}");
+      if (!message && !image) { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "缺 message 或 image" })); }
+      const reply = await chat(String(message || ""), image || null);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ reply }));
     } catch (e) {

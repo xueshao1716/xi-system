@@ -105,6 +105,8 @@
     <section class="pane active" id="pane-chat">
       <div class="msgs" id="msgs"></div>
       <div class="inputbar">
+        <button id="picBtn" title="发图片（曦能看图）" style="background:none;border:1px solid var(--border);border-radius:10px;padding:0 12px;font-size:16px;cursor:pointer;color:var(--dim)">🖼️</button>
+        <input type="file" id="picInput" accept="image/*" hidden>
         <input id="input" placeholder="跟曦说点什么…（Enter 发送）" autocomplete="off">
         <button id="send">发送</button>
       </div>
@@ -205,12 +207,27 @@ function addMsg(role, text) {
   w.querySelector(".bubble").textContent = text;
   $("msgs").appendChild(w); $("msgs").scrollTop = $("msgs").scrollHeight;
 }
+let pendingImage = null;
+$("picBtn").onclick = () => $("picInput").click();
+$("picInput").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    pendingImage = String(r.result).split(",")[1] || null;
+    addMsg("user", "[图片] " + f.name + (pendingImage ? "" : "（读取失败）"));
+    if (!pendingImage) pendingImage = null;
+  };
+  r.readAsDataURL(f);
+  e.target.value = "";
+});
 async function send() {
   const input = $("input"); const q = input.value.trim();
-  if (!q) return; input.value = ""; addMsg("user", q);
+  if (!q && !pendingImage) return;
+  input.value = ""; addMsg("user", q || "[图片]");
+  const img = pendingImage; pendingImage = null;
   $("send").disabled = true; $("send").textContent = "思考中…";
   try {
-    const d = await (await fetch("/api/chat", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ message:q }) })).json();
+    const d = await (await fetch("/api/chat", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ message:q, image:img }) })).json();
     addMsg("xi", d.reply || "（曦没回应）"); loadState();
   } catch (e) { addMsg("xi", "⚠️ 连接失败: "+e.message); }
   $("send").disabled = false; $("send").textContent = "发送";
